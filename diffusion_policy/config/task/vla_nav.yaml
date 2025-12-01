@@ -11,27 +11,26 @@ shape_meta: &shape_meta
   action:
     shape: [2]
 
-task:
-  name: vla_nav
-  dataset:
-    _target_: diffusion_policy.dataset.vla_dataset.VLADataset
-    zarr_path: data/vla_nav_zarr
-    horizon: ${horizon}
-    pad_before: ${eval:'${n_obs_steps}-1'}
-    pad_after: ${eval:'${n_action_steps}-1'}
-    seed: 42
-    val_ratio: 0.02
-    max_train_episodes: null
-  env_runner:
-    _target_: diffusion_policy.env_runner.base_image_runner.BaseImageRunner
-    n_train: 0
-    n_train_vis: 0
-    n_test: 0
-    n_test_vis: 0
-    test_start_seed: 10000
-    max_steps: 100
-    n_obs_steps: ${n_obs_steps}
-    n_action_steps: ${n_action_steps}
-    fps: 10
-    past_action: ${past_action_visible}
-    n_envs: null
+dataset:
+  _target_: diffusion_policy.dataset.vla_dataset.VLADataset
+  zarr_path: /media/dragon_llm/3C09549315E08290/vla_dataset_semantic_ex_traj_v3
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.0
+  max_train_episodes: null
+
+env_runner:
+  _target_: diffusion_policy.env_runner.vla_runner.VLARunner
+  n_train: 0
+  n_train_vis: 0
+  n_test: 0
+  n_test_vis: 0
+  test_start_seed: 10000
+  max_steps: 100
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  past_action: ${past_action_visible}
+  n_envs: null

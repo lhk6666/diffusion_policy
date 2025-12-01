@@ -175,11 +175,12 @@ def main():
     
     # Save to Zarr
     print(f"Saving to {output_dir}...")
-    root = zarr.open(str(output_dir), mode='w')
+    # Force Zarr v2 format for compatibility with older environments (robodiff uses zarr 2.12.0)
+    root = zarr.open(str(output_dir), mode='w', zarr_format=2)
     
     data_group = root.create_group('data')
     
-    # Use create_array instead of create_dataset for Zarr v3 compatibility
+    # Use create_array (Zarr 3.x API) but it will write v2 format
     # state
     data_group.create_array('state', shape=all_states.shape, dtype=all_states.dtype, chunks=(1000, 2))
     data_group['state'][:] = all_states
