@@ -126,8 +126,17 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         result: must include "action" key
         """
         assert 'past_action' not in obs_dict # not implemented yet
+        
+        # Extract text before normalization (text is not in normalizer params)
+        text = obs_dict.pop('text', None)
+        
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
+        
+        # Add text back to normalized obs for encoder
+        if text is not None:
+            nobs['text'] = text
+        
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -142,9 +151,16 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
+        
+        # Extract text before dict_apply (text is a list, not tensor)
+        text_for_encoder = nobs.pop('text', None)
+        
         if self.obs_as_global_cond:
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+            # Add text back for encoder
+            if text_for_encoder is not None:
+                this_nobs['text'] = text_for_encoder
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, Do
             global_cond = nobs_features.reshape(B, -1)
@@ -154,6 +170,9 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         else:
             # condition through impainting
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+            # Add text back for encoder
+            if text_for_encoder is not None:
+                this_nobs['text'] = text_for_encoder
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(B, To, -1)
@@ -192,7 +211,16 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
     def compute_loss(self, batch):
         # normalize input
         assert 'valid_mask' not in batch
+        
+        # Extract text before normalization (text is not in normalizer params)
+        text = batch['obs'].pop('text', None)
+        
         nobs = self.normalizer.normalize(batch['obs'])
+        
+        # Add text back to normalized obs for encoder
+        if text is not None:
+            nobs['text'] = text
+        
         nactions = self.normalizer['action'].normalize(batch['action'])
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
@@ -202,16 +230,26 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         global_cond = None
         trajectory = nactions
         cond_data = trajectory
+        
+        # Extract text before dict_apply (text is a list, not tensor)
+        text_for_encoder = nobs.pop('text', None)
+        
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
                 lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
+            # Add text back for encoder
+            if text_for_encoder is not None:
+                this_nobs['text'] = text_for_encoder
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, Do
             global_cond = nobs_features.reshape(batch_size, -1)
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
+            # Add text back for encoder
+            if text_for_encoder is not None:
+                this_nobs['text'] = text_for_encoder
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)

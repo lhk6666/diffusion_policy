@@ -138,3 +138,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+vlm_dp_result/  

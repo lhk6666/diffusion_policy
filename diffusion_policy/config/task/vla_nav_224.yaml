@@ -1,0 +1,36 @@
+# VLA Navigation Task Configuration
+# 224x224 image resolution for fair comparison with VLA model
+
+name: vla_nav_224
+
+# Shape metadata for the policy
+image_shape: &image_shape [3, 224, 224]
+
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+
+# Dataset configuration
+dataset:
+  _target_: diffusion_policy.dataset.vla_nav_dataset.VLANavDatasetFromPath
+  train_path: /media/dragon_llm/linux_ssd/test_vla_unified_2/train
+  val_path: /media/dragon_llm/linux_ssd/test_vla_unified_2/val
+  horizon: ${horizon}
+  pad_before: 0
+  pad_after: 0
+  seed: 42
+  max_train_episodes: null
+  sample_mode: episode  # 'episode' for VLA-like behavior, 'sliding_window' for standard DP
+  cache_images: true  # Load all images into RAM for faster training (requires ~20GB RAM)
+
+# Environment runner (minimal - our task doesn't use simulation)
+env_runner:
+  _target_: diffusion_policy.env_runner.base_image_runner.BaseImageRunner
+
