@@ -23,6 +23,8 @@ import copy
 import pathlib
 import json
 import zarr
+from torchvision import transforms
+from PIL import Image
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
@@ -62,6 +64,14 @@ class VLANavDataset(BaseImageDataset):
         self.sequence_length = horizon
         self.sample_mode = sample_mode
         self.cache_images = cache_images
+        
+        # Image transform (matches SigLIP preprocessing)
+        # SigLIP expects: [0, 255] -> [0, 1] -> normalize with mean=0.5, std=0.5 -> [-1, 1]
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),  # [0, 255] -> [0, 1]
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # [0, 1] -> [-1, 1]
+        ])
         
         # Open Zarr store
         self.root = zarr.open(str(self.zarr_path), mode='r')
@@ -216,19 +226,24 @@ class VLANavDataset(BaseImageDataset):
         
         Note: For VLA task with n_obs_steps=1, we only need ONE observation image,
         not a sequence of images.
+        
+        Image preprocessing matches SigLIP requirements:
+        - Resize to 224x224
+        - Normalize to [-1, 1] with mean=0.5, std=0.5
         """
         # Only take first n_obs_steps of agent_pos for observation
         # Action is full horizon
         agent_pos = sample['agent_pos'][:1].astype(np.float32)  # (1, 2) for n_obs_steps=1
         
-        # Process single image: (H, W, 3) uint8 -> (1, 3, H, W) float32
-        img = sample['img'].astype(np.float32) / 255.0
-        img = np.moveaxis(img, -1, 0)  # (3, H, W)
-        img = img[np.newaxis, ...]  # (1, 3, H, W)
+        # Process single image with SigLIP-compatible transform
+        # (H, W, 3) uint8 -> PIL -> transform -> (3, 224, 224) float32 in [-1, 1]
+        img_pil = Image.fromarray(sample['img'])
+        img = self.transform(img_pil)  # (3, 224, 224) in [-1, 1]
+        img = img.unsqueeze(0)  # (1, 3, 224, 224)
         
         data = {
             'obs': {
-                'image': img,
+                'image': img.numpy(),  # Will be converted to tensor in __getitem__
                 'agent_pos': agent_pos,
             },
             'action': sample['action'].astype(np.float32)
