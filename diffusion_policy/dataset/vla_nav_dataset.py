@@ -275,6 +275,18 @@ class VLANavDataset(BaseImageDataset):
 
 class VLANavDatasetFromPath(VLANavDataset):
     """VLA Navigation Dataset that loads train or val from separate paths."""
+
+    @staticmethod
+    def _resolve_zarr_path(path: Optional[str]) -> Optional[str]:
+        if path is None:
+            return None
+        p = pathlib.Path(path)
+        # If user passed a split directory containing a nested Zarr store, prefer it.
+        if p.is_dir() and p.suffix != '.zarr':
+            nested = p / 'dataset.zarr'
+            if nested.exists() and nested.is_dir():
+                return str(nested)
+        return str(p)
     
     def __init__(
         self,
@@ -288,6 +300,8 @@ class VLANavDatasetFromPath(VLANavDataset):
         sample_mode: str = 'sliding_window',  # 'sliding_window' or 'episode'
         cache_images: bool = True,  # Load images into RAM
     ):
+        train_path = self._resolve_zarr_path(train_path)
+        val_path = self._resolve_zarr_path(val_path)
         super().__init__(
             zarr_path=train_path,
             horizon=horizon,
