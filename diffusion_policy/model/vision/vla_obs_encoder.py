@@ -14,7 +14,7 @@ Architecture:
 
 import sys
 import os
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Sequence, Union, Tuple
 import torch
 import torch.nn as nn
 
@@ -148,6 +148,148 @@ class VLAObsEncoder(ModuleAttrMixin):
         # Concatenate all features
         result = torch.cat(features, dim=-1)
         return result
+
+
+class VLAObsEncoderV2(ModuleAttrMixin):
+    """V2 adapter for Diffusion Policy that matches FlowVLA encoder contract.
+
+    Key fixes vs `VLAObsEncoder`:
+    - Uses `VLAEncoder`'s returned `context` directly (shape [B, d_model]).
+    - Robustly expands text / token batches to match flattened image batches (B*To).
+      Diffusion Policy flattens time for tensors, but leaves `text` as length-B list.
+    """
+
+    def __init__(
+        self,
+        shape_meta: dict,
+        siglip_model_name: str = "google/siglip2-base-patch16-224",
+        d_model: int = 768,
+        num_heads: int = 8,
+        num_fusion_layers: int = 2,
+        unfreeze_last_n_layers: int = 0,
+        siglip_deterministic_embeddings: bool = True,
+        default_text: str = "navigate to the target",
+        imagenet_norm: bool = False,
+    ):
+        super().__init__()
+
+        self.shape_meta = shape_meta
+        self.d_model = d_model
+        self.default_text = default_text
+
+        # Parse shape meta
+        self.rgb_keys = []
+        self.low_dim_keys = []
+        self.key_shape_map = {}
+
+        obs_shape_meta = shape_meta['obs']
+        for key, attr in obs_shape_meta.items():
+            shape = tuple(attr['shape'])
+            obs_type = attr.get('type', 'low_dim')
+            self.key_shape_map[key] = shape
+
+            if obs_type == 'rgb':
+                self.rgb_keys.append(key)
+            elif obs_type == 'low_dim':
+                self.low_dim_keys.append(key)
+
+        self.rgb_keys = sorted(self.rgb_keys)
+        self.low_dim_keys = sorted(self.low_dim_keys)
+
+        self.encoder = VLAEncoder(
+            siglip_model_name=siglip_model_name,
+            unfreeze_last_n_layers=unfreeze_last_n_layers,
+            siglip_deterministic_embeddings=siglip_deterministic_embeddings,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_fusion_layers=num_fusion_layers,
+        )
+
+        low_dim_size = sum(self.key_shape_map[k][-1] for k in self.low_dim_keys)
+        self.low_dim_size = low_dim_size
+        self.output_dim = d_model + low_dim_size
+
+    @staticmethod
+    def _expand_list_to_batch(texts: Sequence[str], target_batch: int) -> List[str]:
+        if len(texts) == 0:
+            return []
+        if len(texts) == target_batch:
+            return list(texts)
+        if target_batch % len(texts) == 0:
+            rep = target_batch // len(texts)
+            return [t for t in texts for _ in range(rep)]
+        if len(texts) == 1:
+            return [texts[0]] * target_batch
+        raise ValueError(
+            f"Cannot expand texts batch of size {len(texts)} to match target_batch={target_batch}."
+        )
+
+    @staticmethod
+    def _expand_tensor_to_batch(x: torch.Tensor, target_batch: int) -> torch.Tensor:
+        if x.shape[0] == target_batch:
+            return x
+        if target_batch % x.shape[0] == 0:
+            rep = target_batch // x.shape[0]
+            return x.repeat_interleave(rep, dim=0)
+        if x.shape[0] == 1:
+            return x.expand(target_batch, *x.shape[1:])
+        raise ValueError(
+            f"Cannot expand tensor batch of size {x.shape[0]} to match target_batch={target_batch}."
+        )
+
+    def _get_condition_inputs(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        target_batch: int,
+    ) -> Tuple[Union[torch.Tensor, str, List[str]], Optional[torch.Tensor]]:
+        """Pick (texts_or_input_ids, attention_mask) and expand to `target_batch` if needed."""
+        input_ids = obs_dict.get('input_ids', None)
+        attention_mask = obs_dict.get('attention_mask', None)
+        if input_ids is not None:
+            if not torch.is_tensor(input_ids):
+                raise TypeError("obs_dict['input_ids'] must be a torch.Tensor")
+            input_ids = self._expand_tensor_to_batch(input_ids, target_batch)
+            if attention_mask is not None:
+                if not torch.is_tensor(attention_mask):
+                    raise TypeError("obs_dict['attention_mask'] must be a torch.Tensor")
+                attention_mask = self._expand_tensor_to_batch(attention_mask, target_batch)
+            return input_ids, attention_mask
+
+        texts = obs_dict.get('text', None)
+        if texts is None:
+            return [self.default_text] * target_batch, None
+        if isinstance(texts, str):
+            return [texts] * target_batch, None
+        if isinstance(texts, (list, tuple)):
+            return self._expand_list_to_batch(texts, target_batch), None
+
+        raise TypeError("obs_dict['text'] must be str or list[str] when provided")
+
+    def forward(self, obs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        batch_size = None
+        features: List[torch.Tensor] = []
+
+        for key in self.rgb_keys:
+            img = obs_dict[key]
+            if batch_size is None:
+                batch_size = img.shape[0]
+
+            texts_or_input_ids, attention_mask = self._get_condition_inputs(obs_dict, batch_size)
+            context_tokens, _ = self.encoder(img, texts_or_input_ids, attention_mask=attention_mask)  # [B, N_v, d_model]
+            context = context_tokens.mean(dim=1)
+            features.append(context)
+
+        for key in self.low_dim_keys:
+            data = obs_dict[key]
+            if batch_size is None:
+                batch_size = data.shape[0]
+            features.append(data)
+
+        return torch.cat(features, dim=-1)
+
+    @torch.no_grad()
+    def output_shape(self):
+        return (self.output_dim,)
     
     @torch.no_grad()
     def output_shape(self):
