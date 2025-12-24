@@ -20,8 +20,8 @@ shape_meta: &shape_meta
 # Dataset configuration
 dataset:
   _target_: diffusion_policy.dataset.vla_nav_dataset.VLANavDatasetFromPath
-  train_path: /media/dragon_llm/linux_ssd/vla_dataset_unified_static_v8/train/dataset.zarr
-  val_path: /media/dragon_llm/linux_ssd/vla_dataset_unified_static_v8/val/dataset.zarr
+  train_path: /media/dragon_llm/linux_ssd/vla_dataset_unified_static_v10/train/dataset.zarr
+  val_path: /media/dragon_llm/linux_ssd/vla_dataset_unified_static_v10/val/dataset.zarr
   horizon: ${horizon}
   pad_before: 0
   pad_after: 0
