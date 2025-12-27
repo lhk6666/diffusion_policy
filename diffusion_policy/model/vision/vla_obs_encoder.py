@@ -43,7 +43,7 @@ class VLAObsEncoder(ModuleAttrMixin):
         siglip_model_name: str = "google/siglip2-base-patch16-224",
         d_model: int = 768,
         num_heads: int = 8,
-        num_fusion_layers: int = 2,
+        num_fusion_layers: int = 4,
         unfreeze_last_n_layers: int = 0,
         # Default text for inference
         default_text: str = "navigate to the target",
@@ -130,13 +130,16 @@ class VLAObsEncoder(ModuleAttrMixin):
             texts = obs_dict.get('text', None)
             if texts is None:
                 texts = [self.default_text] * batch_size
-            
-            # Forward through VLAEncoder
-            context, _ = self.encoder(img, texts)  # [B, N_v, d_model]
-            
-            # Pool over visual tokens to get [B, d_model]
-            context_pooled = context.mean(dim=1)
-            features.append(context_pooled)
+            # Forward through FlowVLA VLAEncoder.
+            # Depending on FlowVLA version, `context` can be:
+            # - token context: [B, N, D]
+            # - pooled context: [B, D]
+            context, _ = self.encoder(img, texts)
+            if context.ndim == 3:
+                context = context.mean(dim=1)
+            elif context.ndim != 2:
+                raise RuntimeError(f"Unexpected encoder context shape: {tuple(context.shape)}")
+            features.append(context)
         
         # Process low_dim inputs (direct concat, no projection)
         for key in self.low_dim_keys:
@@ -275,8 +278,11 @@ class VLAObsEncoderV2(ModuleAttrMixin):
                 batch_size = img.shape[0]
 
             texts_or_input_ids, attention_mask = self._get_condition_inputs(obs_dict, batch_size)
-            context_tokens, _ = self.encoder(img, texts_or_input_ids, attention_mask=attention_mask)  # [B, N_v, d_model]
-            context = context_tokens.mean(dim=1)
+            context, _ = self.encoder(img, texts_or_input_ids, attention_mask=attention_mask)
+            if context.ndim == 3:
+                context = context.mean(dim=1)
+            elif context.ndim != 2:
+                raise RuntimeError(f"Unexpected encoder context shape: {tuple(context.shape)}")
             features.append(context)
 
         for key in self.low_dim_keys:
@@ -284,13 +290,8 @@ class VLAObsEncoderV2(ModuleAttrMixin):
             if batch_size is None:
                 batch_size = data.shape[0]
             features.append(data)
-
         return torch.cat(features, dim=-1)
 
-    @torch.no_grad()
-    def output_shape(self):
-        return (self.output_dim,)
-    
     @torch.no_grad()
     def output_shape(self):
         """Return output shape for DP compatibility."""

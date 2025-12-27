@@ -26,7 +26,7 @@ import zarr
 from torchvision import transforms
 from PIL import Image
 from diffusion_policy.common.pytorch_util import dict_apply
-from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.common.normalize_util import get_image_range_normalizer
 
@@ -99,9 +99,16 @@ class VLANavDataset(BaseImageDataset):
         # Compute episode starts
         self.episode_starts = np.concatenate([[0], self.episode_ends[:-1]])
         
-        # Load episode metadata if available
-        meta_path = self.zarr_path / 'episode_meta.json'
-        if meta_path.exists():
+        # Load episode metadata if available.
+        # Depending on how the dataset is packaged, episode_meta.json may live:
+        #  - inside the zarr directory: <split>/dataset.zarr/episode_meta.json
+        #  - alongside the zarr directory: <split>/episode_meta.json
+        meta_candidates = [
+            self.zarr_path / 'episode_meta.json',
+            self.zarr_path.parent / 'episode_meta.json',
+        ]
+        meta_path = next((p for p in meta_candidates if p.exists()), None)
+        if meta_path is not None:
             with open(meta_path, 'r') as f:
                 self.metadata = json.load(f)
         else:
@@ -172,7 +179,10 @@ class VLANavDataset(BaseImageDataset):
         
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
-        normalizer['image'] = get_image_range_normalizer()
+        # Images are already normalized to [-1, 1] by `self.transform`.
+        # Using `get_image_range_normalizer()` here would incorrectly map
+        # [-1, 1] -> [-3, 1], hurting training.
+        normalizer['image'] = SingleFieldLinearNormalizer.create_identity(dtype=torch.float32)
         
         return normalizer
     

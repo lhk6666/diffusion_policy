@@ -35,140 +35,98 @@ import matplotlib.pyplot as plt
 script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(script_dir))
 
+# Also add FlowVLA root to path so we can share evaluation metrics.
+FLOWVLA_ROOT = script_dir.parents[2]
+sys.path.insert(0, str(FLOWVLA_ROOT))
+
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.common.pytorch_util import dict_apply
 
 
-# Standard number of waypoints for fair curvature comparison
-STANDARD_NUM_WAYPOINTS = 20
+# Shared metrics implementation (preferred). Fallback keeps this script runnable standalone.
+try:
+    from scripts.test.trajectory_metrics import (
+        STANDARD_NUM_WAYPOINTS,
+        resample_trajectory,
+        TrajectoryMetrics,
+    )
+except Exception:
+    STANDARD_NUM_WAYPOINTS = 20
 
+    def resample_trajectory(traj: np.ndarray, num_points: int) -> np.ndarray:
+        if traj is None:
+            return np.zeros((num_points, 2), dtype=np.float32)
+        traj = np.asarray(traj)
+        if len(traj) < 2:
+            return np.repeat(traj[:1], num_points, axis=0) if len(traj) == 1 else np.zeros((num_points, 2), dtype=np.float32)
+        if len(traj) == num_points:
+            return traj
+        diffs = np.diff(traj, axis=0)
+        segment_lengths = np.linalg.norm(diffs, axis=1)
+        cumulative_length = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+        total_length = float(cumulative_length[-1])
+        if total_length < 1e-8:
+            return np.repeat(traj[:1], num_points, axis=0)
+        target_lengths = np.linspace(0.0, total_length, num_points)
+        resampled = np.zeros((num_points, 2), dtype=traj.dtype)
+        seg_idx = 0
+        for i, target_len in enumerate(target_lengths):
+            while seg_idx < len(segment_lengths) - 1 and cumulative_length[seg_idx + 1] < target_len:
+                seg_idx += 1
+            seg_start = cumulative_length[seg_idx]
+            seg_end = cumulative_length[seg_idx + 1]
+            denom = max(seg_end - seg_start, 1e-8)
+            alpha = float((target_len - seg_start) / denom)
+            resampled[i] = (1.0 - alpha) * traj[seg_idx] + alpha * traj[seg_idx + 1]
+        return resampled
 
-def resample_trajectory(traj: np.ndarray, num_points: int) -> np.ndarray:
-    """
-    Resample trajectory to fixed number of points using linear interpolation.
-    This ensures fair comparison of curvature across different methods.
-    
-    Args:
-        traj: Original trajectory [N, 2]
-        num_points: Target number of points
-    
-    Returns:
-        Resampled trajectory [num_points, 2]
-    """
-    if len(traj) < 2:
-        return traj
-    
-    if len(traj) == num_points:
-        return traj
-    
-    # Compute cumulative arc length
-    diffs = np.diff(traj, axis=0)
-    segment_lengths = np.linalg.norm(diffs, axis=1)
-    cumulative_length = np.concatenate([[0], np.cumsum(segment_lengths)])
-    total_length = cumulative_length[-1]
-    
-    if total_length < 1e-8:
-        return np.tile(traj[0], (num_points, 1))
-    
-    # Generate uniform samples along arc length
-    target_lengths = np.linspace(0, total_length, num_points)
-    
-    # Interpolate
-    resampled = np.zeros((num_points, 2))
-    for i, target_len in enumerate(target_lengths):
-        idx = np.searchsorted(cumulative_length, target_len, side='right') - 1
-        idx = np.clip(idx, 0, len(traj) - 2)
-        
-        seg_start_len = cumulative_length[idx]
-        seg_len = segment_lengths[idx] if idx < len(segment_lengths) else 1e-8
-        
-        if seg_len < 1e-8:
-            t = 0
-        else:
-            t = (target_len - seg_start_len) / seg_len
-        t = np.clip(t, 0, 1)
-        
-        resampled[i] = traj[idx] * (1 - t) + traj[idx + 1] * t
-    
-    return resampled
+    class TrajectoryMetrics:
+        def __init__(self, pred_traj: np.ndarray, gt_traj: np.ndarray, goal_pos: np.ndarray, obstacle_mask: Optional[np.ndarray] = None):
+            self.pred_traj = np.asarray(pred_traj)
+            self.gt_traj = np.asarray(gt_traj)
+            self.goal_pos = np.asarray(goal_pos)
+            self.obstacle_mask = obstacle_mask
 
+        def final_goal_error(self) -> float:
+            if len(self.pred_traj) == 0:
+                return float('inf')
+            return float(np.linalg.norm(self.pred_traj[-1] - self.goal_pos))
 
-class TrajectoryMetrics:
-    """
-    Trajectory evaluation metrics (same as HMRS/scripts/test/metrics.py)
-    - FGE: Final Goal Error (Euclidean distance to goal)
-    - CR: Collision Rate (1 if any point hits obstacle, 0 otherwise)
-    - PLR: Path Length Ratio (pred_length / gt_length)
-    - Curv: Curvature (mean absolute angle change between segments)
-    
-    Note: Curvature is computed on resampled trajectory (STANDARD_NUM_WAYPOINTS points)
-    for fair comparison across methods with different waypoint counts.
-    """
-    def __init__(self, pred_traj: np.ndarray, gt_traj: np.ndarray, 
-                 goal_pos: np.ndarray, obstacle_mask: Optional[np.ndarray] = None):
-        self.pred_traj = np.array(pred_traj)
-        self.gt_traj = np.array(gt_traj)
-        self.goal_pos = np.array(goal_pos)
-        self.obstacle_mask = obstacle_mask  # (H, W) binary mask, 1=obstacle
-        
-    def final_goal_error(self) -> float:
-        """FGE: Euclidean distance from final position to goal"""
-        if len(self.pred_traj) == 0:
-            return float('inf')
-        return float(np.linalg.norm(self.pred_traj[-1] - self.goal_pos))
-    
-    def collision_rate(self) -> float:
-        """CR: 1.0 if trajectory collides with obstacle, 0.0 otherwise"""
-        if self.obstacle_mask is None:
+        def collision_rate(self) -> float:
+            if self.obstacle_mask is None:
+                return 0.0
+            mask = np.asarray(self.obstacle_mask)
+            H, W = mask.shape[:2]
+            for pt in self.pred_traj:
+                cx = int(pt[0] * W)
+                cy = int(pt[1] * H)
+                cx = np.clip(cx, 0, W - 1)
+                cy = np.clip(cy, 0, H - 1)
+                if mask[cy, cx] == 1:
+                    return 1.0
             return 0.0
-        H, W = self.obstacle_mask.shape
-        for pt in self.pred_traj:
-            # Convert normalized [0,1] to pixel coordinates
-            cx = int(pt[0] * W)
-            cy = int(pt[1] * H)
-            # Clamp to valid range
-            cx = np.clip(cx, 0, W - 1)
-            cy = np.clip(cy, 0, H - 1)
-            if self.obstacle_mask[cy, cx] == 1:
+
+        def path_length_ratio(self) -> float:
+            if len(self.pred_traj) < 2 or len(self.gt_traj) < 2:
                 return 1.0
-        return 0.0
-    
-    def path_length_ratio(self) -> float:
-        """PLR: pred_path_length / gt_path_length"""
-        if len(self.pred_traj) < 2 or len(self.gt_traj) < 2:
-            return 1.0
-        pred_len = self._compute_path_length(self.pred_traj)
-        gt_len = self._compute_path_length(self.gt_traj)
-        return float(pred_len / gt_len) if gt_len > 1e-6 else 1.0
-    
-    def curvature(self, num_points: int = STANDARD_NUM_WAYPOINTS) -> float:
-        """Curv: Mean absolute angle change between consecutive segments (radians)
-        
-        Note: Trajectory is resampled to num_points for fair comparison.
-        """
-        resampled_traj = resample_trajectory(self.pred_traj, num_points)
-        return self._compute_curvature(resampled_traj)
-    
-    def _compute_path_length(self, path: np.ndarray) -> float:
-        """Compute total path length"""
-        if len(path) < 2:
-            return 0.0
-        return float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
-    
-    def _compute_curvature(self, path: np.ndarray) -> float:
-        """Compute mean curvature as angle change between segments"""
-        if len(path) < 3:
-            return 0.0
-        vectors = path[1:] - path[:-1]
-        norms = np.linalg.norm(vectors, axis=1)
-        valid = norms > 1e-6
-        vectors = vectors[valid]
-        if len(vectors) < 2:
-            return 0.0
-        angles = np.arctan2(vectors[:, 1], vectors[:, 0])
-        diffs = angles[1:] - angles[:-1]
-        diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
-        return float(np.mean(np.abs(diffs)))
+            pred_len = float(np.sum(np.linalg.norm(np.diff(self.pred_traj, axis=0), axis=1)))
+            gt_len = float(np.sum(np.linalg.norm(np.diff(self.gt_traj, axis=0), axis=1)))
+            return float(pred_len / gt_len) if gt_len > 1e-6 else 1.0
+
+        def curvature(self, num_points: int = STANDARD_NUM_WAYPOINTS) -> float:
+            resampled_traj = resample_trajectory(self.pred_traj, num_points)
+            if len(resampled_traj) < 3:
+                return 0.0
+            vectors = resampled_traj[1:] - resampled_traj[:-1]
+            norms = np.linalg.norm(vectors, axis=1)
+            valid = norms > 1e-6
+            vectors = vectors[valid]
+            if len(vectors) < 2:
+                return 0.0
+            angles = np.arctan2(vectors[:, 1], vectors[:, 0])
+            diffs = angles[1:] - angles[:-1]
+            diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
+            return float(np.mean(np.abs(diffs)))
 
 
 @dataclass 
@@ -303,18 +261,18 @@ def load_dp_model(checkpoint_path: str, device: str = 'cuda:0'):
     
     # Fix state_dict key compatibility: old checkpoints use 'self_attn', new code uses 'cross_attn'
     # Only process the model we need
-    if 'state_dicts' in payload and model_key in payload['state_dicts']:
-        old_state = payload['state_dicts'][model_key]
-        new_state = {}
-        for k, v in old_state.items():
-            # Rename self_attn -> cross_attn in fusion layers (old checkpoint compatibility)
-            if '.fusion.layers.' in k and '.self_attn.' in k:
-                new_k = k.replace('.self_attn.', '.cross_attn.')
-                print(f"  Renaming: {k.split('.')[-2]}.{k.split('.')[-1]} -> cross_attn.*")
-                new_state[new_k] = v
-            else:
-                new_state[k] = v
-        payload['state_dicts'][model_key] = new_state
+    # if 'state_dicts' in payload and model_key in payload['state_dicts']:
+    #     old_state = payload['state_dicts'][model_key]
+    #     new_state = {}
+    #     for k, v in old_state.items():
+    #         # Rename self_attn -> cross_attn in fusion layers (old checkpoint compatibility)
+    #         if '.fusion.layers.' in k and '.self_attn.' in k:
+    #             new_k = k.replace('.self_attn.', '.cross_attn.')
+    #             print(f"  Renaming: {k.split('.')[-2]}.{k.split('.')[-1]} -> cross_attn.*")
+    #             new_state[new_k] = v
+    #         else:
+    #             new_state[k] = v
+    #     payload['state_dicts'][model_key] = new_state
     
     # Create workspace and load only the needed model
     cls = hydra.utils.get_class(cfg._target_)
@@ -516,6 +474,10 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
                 instruction=episode.instruction,  # Pass instruction!
                 device=device, horizon=len(episode.gt_trajectory)
             )
+
+        # Keep metrics comparable: trim prediction to GT length if needed.
+        if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
+            pred_traj = pred_traj[:len(episode.gt_trajectory)]
         
         # Compute metrics
         metrics = TrajectoryMetrics(
@@ -578,7 +540,7 @@ def main():
     parser.add_argument('--checkpoint', '-c', type=str, required=True,
                        help='Path to DP checkpoint')
     parser.add_argument('--dataset', type=str,
-                       default='/media/dragon_llm/linux_ssd/vla_dp_224/val',
+                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v10/val',
                        help='Path to validation Zarr dataset')
     parser.add_argument('--output_dir', '-o', type=str, default='dp_eval_results',
                        help='Output directory')
@@ -667,6 +629,9 @@ def main():
                 }
                 
                 try:
+                    # Keep metrics comparable: trim prediction to GT length if needed.
+                    if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
+                        pred_traj = pred_traj[:len(episode.gt_trajectory)]
                     metrics = TrajectoryMetrics(
                         pred_traj=pred_traj,
                         gt_traj=episode.gt_trajectory,

@@ -2,6 +2,7 @@ from typing import Union
 import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import einops
 from einops.layers.torch import Rearrange
 
@@ -181,6 +182,10 @@ class ConditionalUnet1D(nn.Module):
         global_cond: (B,global_cond_dim)
         output: (B,T,input_dim)
         """
+        # Keep the original horizon so we can guarantee shape consistency.
+        # With strided conv downsampling + transposed-conv upsampling,
+        # odd horizons can expand (e.g., 101 -> 104) depending on padding.
+        input_horizon = sample.shape[1]
         sample = einops.rearrange(sample, 'b h t -> b t h')
 
         # 1. time
@@ -224,7 +229,17 @@ class ConditionalUnet1D(nn.Module):
             x = mid_module(x, global_feature)
 
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
-            x = torch.cat((x, h.pop()), dim=1)
+            skip = h.pop()
+            # Handle odd-length horizons: down/upsampling can cause off-by-one length
+            # mismatches between the current feature map and skip connections.
+            if x.shape[-1] != skip.shape[-1]:
+                target_len = x.shape[-1]
+                skip_len = skip.shape[-1]
+                if skip_len > target_len:
+                    skip = skip[..., :target_len]
+                else:
+                    skip = F.pad(skip, (0, target_len - skip_len))
+            x = torch.cat((x, skip), dim=1)
             x = resnet(x, global_feature)
             # The correct condition should be:
             # if idx == (len(self.up_modules)-1) and len(h_local) > 0:
@@ -238,5 +253,16 @@ class ConditionalUnet1D(nn.Module):
         x = self.final_conv(x)
 
         x = einops.rearrange(x, 'b t h -> b h t')
+
+        # Enforce output horizon == input horizon.
+        out_horizon = x.shape[1]
+        if out_horizon != input_horizon:
+            if out_horizon > input_horizon:
+                x = x[:, :input_horizon, :]
+            else:
+                # pad by repeating the last timestep
+                pad_len = input_horizon - out_horizon
+                last = x[:, -1:, :].expand(-1, pad_len, -1)
+                x = torch.cat([x, last], dim=1)
         return x
 
