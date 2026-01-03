@@ -17,6 +17,7 @@ python evaluate_dp_dataset.py \
 import os
 import sys
 import json
+import random
 import zarr
 import numpy as np
 import torch
@@ -27,9 +28,19 @@ from tqdm import tqdm
 import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
+import re
+import time
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # Add diffusion_policy to path
 script_dir = Path(__file__).resolve().parent
@@ -51,7 +62,7 @@ try:
         TrajectoryMetrics,
     )
 except Exception:
-    STANDARD_NUM_WAYPOINTS = 20
+    STANDARD_NUM_WAYPOINTS = 100
 
     def resample_trajectory(traj: np.ndarray, num_points: int) -> np.ndarray:
         if traj is None:
@@ -90,14 +101,16 @@ except Exception:
         def final_goal_error(self) -> float:
             if len(self.pred_traj) == 0:
                 return float('inf')
-            return float(np.linalg.norm(self.pred_traj[-1] - self.goal_pos))
+            pred_rs = resample_trajectory(self.pred_traj, STANDARD_NUM_WAYPOINTS)
+            return float(np.linalg.norm(pred_rs[-1] - self.goal_pos))
 
         def collision_rate(self) -> float:
             if self.obstacle_mask is None:
                 return 0.0
             mask = np.asarray(self.obstacle_mask)
             H, W = mask.shape[:2]
-            for pt in self.pred_traj:
+            pred_rs = resample_trajectory(self.pred_traj, STANDARD_NUM_WAYPOINTS)
+            for pt in pred_rs:
                 cx = int(pt[0] * W)
                 cy = int(pt[1] * H)
                 cx = np.clip(cx, 0, W - 1)
@@ -109,8 +122,10 @@ except Exception:
         def path_length_ratio(self) -> float:
             if len(self.pred_traj) < 2 or len(self.gt_traj) < 2:
                 return 1.0
-            pred_len = float(np.sum(np.linalg.norm(np.diff(self.pred_traj, axis=0), axis=1)))
-            gt_len = float(np.sum(np.linalg.norm(np.diff(self.gt_traj, axis=0), axis=1)))
+            pred_rs = resample_trajectory(self.pred_traj, STANDARD_NUM_WAYPOINTS)
+            gt_rs = resample_trajectory(self.gt_traj, STANDARD_NUM_WAYPOINTS)
+            pred_len = float(np.sum(np.linalg.norm(np.diff(pred_rs, axis=0), axis=1)))
+            gt_len = float(np.sum(np.linalg.norm(np.diff(gt_rs, axis=0), axis=1)))
             return float(pred_len / gt_len) if gt_len > 1e-6 else 1.0
 
         def curvature(self, num_points: int = STANDARD_NUM_WAYPOINTS) -> float:
@@ -361,6 +376,7 @@ def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: 
     img_tensors = []
     for img in images:
         img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        img_t = (img_t - 0.5) / 0.5  # Normalize to [-1, 1] if needed
         img_tensors.append(img_t)
     img_batch = torch.stack(img_tensors, dim=0).unsqueeze(1).to(device)  # (B, 1, 3, H, W)
     
@@ -460,6 +476,7 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
         'has_mask': episode.obstacle_mask is not None
     }
     try:
+        t0 = time.perf_counter()
         if use_rollout:
             # Use receding horizon rollout
             pred_traj = rollout_trajectory(
@@ -474,6 +491,8 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
                 instruction=episode.instruction,  # Pass instruction!
                 device=device, horizon=len(episode.gt_trajectory)
             )
+        t1 = time.perf_counter()
+        result['inference_ms'] = float((t1 - t0) * 1000.0)
 
         # Keep metrics comparable: trim prediction to GT length if needed.
         if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
@@ -550,11 +569,18 @@ def main():
                        help='Device to use')
     parser.add_argument('--use_rollout', action='store_true',
                        help='Use receding horizon rollout instead of single-shot')
-    parser.add_argument('--visualize_every', type=int, default=100,
+    parser.add_argument('--visualize_every', type=int, default=1000,
                        help='Visualize every N episodes (0 = disabled)')
     parser.add_argument('--batch_size', type=int, default=32,
                        help='Batch size for inference (default: 32)')
+    parser.add_argument('--num_inference_steps', type=int, default=None,
+                       help='Override diffusion denoising steps at inference time (if supported by the policy)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Optional random seed for reproducible evaluation')
     args = parser.parse_args()
+
+    if args.seed is not None:
+        set_seed(int(args.seed))
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -562,7 +588,17 @@ def main():
     
     # Load model
     policy, cfg = load_dp_model(args.checkpoint, args.device)
+
+    # Optionally override diffusion sampling iterations.
+    # Most DiffusionPolicy implementations expose this as `policy.num_inference_steps`.
+    if args.num_inference_steps is not None:
+        if hasattr(policy, 'num_inference_steps'):
+            policy.num_inference_steps = int(args.num_inference_steps)
+        else:
+            print("Warning: policy has no attribute 'num_inference_steps'; ignoring --num_inference_steps")
     print(f"Model loaded. Horizon: {policy.horizon}, n_action_steps: {policy.n_action_steps}")
+    if hasattr(policy, 'num_inference_steps'):
+        print(f"Inference denoising steps: {policy.num_inference_steps}")
     
     # Load dataset
     print(f"\nLoading dataset from {args.dataset}")
@@ -575,6 +611,7 @@ def main():
     
     results = []
     all_pred_trajs = []
+    inference_ms_values: List[float] = []
     vis_dir = output_dir / "visualizations"
     if args.visualize_every > 0:
         vis_dir.mkdir(exist_ok=True)
@@ -596,20 +633,29 @@ def main():
             
             # Batch inference
             try:
+                t0 = time.perf_counter()
                 pred_trajs = predict_trajectory_batch(
                     policy, images, starts, instructions, args.device
                 )
+                t1 = time.perf_counter()
+                per_episode_ms = float((t1 - t0) * 1000.0 / max(1, len(batch_episodes)))
+                batch_inference_ms = [per_episode_ms for _ in range(len(batch_episodes))]
             except Exception as e:
                 print(f"Batch inference failed: {e}, falling back to single inference")
                 pred_trajs = []
+                batch_inference_ms = []
                 for ep in batch_episodes:
                     try:
+                        t0 = time.perf_counter()
                         traj = predict_trajectory(
                             policy, ep.image, ep.start, ep.instruction, args.device
                         )
+                        t1 = time.perf_counter()
                         pred_trajs.append(traj)
+                        batch_inference_ms.append(float((t1 - t0) * 1000.0))
                     except:
                         pred_trajs.append(np.zeros((10, 2)))
+                        batch_inference_ms.append(float('nan'))
             
             # Compute metrics for each episode in batch
             for i, (episode, pred_traj) in enumerate(zip(batch_episodes, pred_trajs)):
@@ -627,6 +673,8 @@ def main():
                     'curv': 0.0,
                     'has_mask': episode.obstacle_mask is not None
                 }
+                if i < len(batch_inference_ms):
+                    result['inference_ms'] = float(batch_inference_ms[i])
                 
                 try:
                     # Keep metrics comparable: trim prediction to GT length if needed.
@@ -649,6 +697,8 @@ def main():
                 
                 results.append(result)
                 all_pred_trajs.append(pred_traj)
+                if np.isfinite(result.get('inference_ms', float('nan'))):
+                    inference_ms_values.append(float(result['inference_ms']))
                 
                 # Visualize
                 if args.visualize_every > 0 and idx % args.visualize_every == 0:
@@ -664,6 +714,8 @@ def main():
             result, pred_traj = evaluate_episode(policy, episode, args.device, args.use_rollout)
             results.append(result)
             all_pred_trajs.append(pred_traj)
+            if np.isfinite(result.get('inference_ms', float('nan'))):
+                inference_ms_values.append(float(result['inference_ms']))
             
             # Visualize
             if args.visualize_every > 0 and idx % args.visualize_every == 0:
@@ -681,6 +733,7 @@ def main():
     plr_values = [r['plr'] for r in valid_results]
     curv_values = [r['curv'] for r in valid_results]
     mask_count = sum(1 for r in valid_results if r.get('has_mask', False))
+    valid_inference_ms = [float(r['inference_ms']) for r in valid_results if np.isfinite(r.get('inference_ms', float('nan')))]
     
     print("\n" + "=" * 60)
     print("RESULTS SUMMARY - Diffusion Policy")
@@ -694,11 +747,32 @@ def main():
     print(f"  CR   (Collision Rate):    {np.mean(cr_values)*100:.2f}%")
     print(f"  PLR  (Path Length Ratio): {np.mean(plr_values):.4f} ± {np.std(plr_values):.4f}")
     print(f"  Curv (Curvature):         {np.mean(curv_values):.4f} ± {np.std(curv_values):.4f}")
+    if len(valid_inference_ms) > 0:
+        print(f"\nPerformance:")
+        print(f"  Inference latency:        {np.mean(valid_inference_ms):.2f} ms/episode ± {np.std(valid_inference_ms):.2f} ms")
+
+    def scene_group_id(scene_id: str) -> str:
+        """Group scene variants like scene700_01/scene700_02 into scene700."""
+        if not scene_id:
+            return 'unknown'
+        s = str(scene_id).strip()
+        s = s.split('/')[-1].split('\\')[-1]
+        m = re.match(r'^(scene\d+)(?:[_-]\d+)?$', s)
+        if m:
+            return m.group(1)
+        parts = re.split(r'[_-]', s)
+        if parts and re.fullmatch(r'scene\d+', parts[0]):
+            return parts[0]
+        m = re.match(r'^(scene\d+)', s)
+        if m:
+            return m.group(1)
+        return s
     
     # Per-scene results
     scene_results = {}
     for r in valid_results:
-        scene_id = r.get('scene_id', 'unknown')
+        scene_id_raw = r.get('scene_id', 'unknown')
+        scene_id = scene_group_id(scene_id_raw)
         if scene_id not in scene_results:
             scene_results[scene_id] = []
         scene_results[scene_id].append(r)
@@ -709,17 +783,36 @@ def main():
     
     scene_summary = []
     for scene_id, scene_res in sorted(scene_results.items()):
-        scene_fge = np.mean([r['fge'] for r in scene_res])
-        scene_cr = np.mean([r['cr'] for r in scene_res])
-        scene_plr = np.mean([r['plr'] for r in scene_res])
-        scene_curv = np.mean([r['curv'] for r in scene_res])
-        print(f"{scene_id}: FGE={scene_fge:.4f}, CR={scene_cr*100:.1f}%, PLR={scene_plr:.3f}, Curv={scene_curv:.4f}, N={len(scene_res)}")
+        scene_fge_vals = [r['fge'] for r in scene_res]
+        scene_cr_vals = [r['cr'] for r in scene_res]
+        scene_plr_vals = [r['plr'] for r in scene_res]
+        scene_curv_vals = [r['curv'] for r in scene_res]
+
+        scene_fge = float(np.mean(scene_fge_vals))
+        scene_fge_std = float(np.std(scene_fge_vals))
+        scene_cr = float(np.mean(scene_cr_vals))
+        scene_cr_std = float(np.std(scene_cr_vals))
+        scene_plr = float(np.mean(scene_plr_vals))
+        scene_plr_std = float(np.std(scene_plr_vals))
+        scene_curv = float(np.mean(scene_curv_vals))
+        scene_curv_std = float(np.std(scene_curv_vals))
+
+        print(
+            f"{scene_id}: FGE={scene_fge:.4f} ± {scene_fge_std:.4f}, "
+            f"CR={scene_cr*100:.1f}% ± {scene_cr_std*100:.1f}%, "
+            f"PLR={scene_plr:.3f} ± {scene_plr_std:.3f}, "
+            f"Curv={scene_curv:.4f} ± {scene_curv_std:.4f}, N={len(scene_res)}"
+        )
         scene_summary.append({
             'scene_id': scene_id,
-            'fge': float(scene_fge),
-            'cr': float(scene_cr),
-            'plr': float(scene_plr),
-            'curv': float(scene_curv),
+            'fge': scene_fge,
+            'fge_std': scene_fge_std,
+            'cr': scene_cr,
+            'cr_std': scene_cr_std,
+            'plr': scene_plr,
+            'plr_std': scene_plr_std,
+            'curv': scene_curv,
+            'curv_std': scene_curv_std,
             'num_episodes': len(scene_res)
         })
     
@@ -741,6 +834,8 @@ def main():
                 'plr_std': float(np.std(plr_values)),
                 'curv_mean': float(np.mean(curv_values)),
                 'curv_std': float(np.std(curv_values)),
+                'inference_ms_mean': float(np.mean(valid_inference_ms)) if len(valid_inference_ms) > 0 else None,
+                'inference_ms_std': float(np.std(valid_inference_ms)) if len(valid_inference_ms) > 0 else None,
                 'num_valid': len(valid_results),
                 'num_with_mask': mask_count
             },
@@ -749,15 +844,29 @@ def main():
         }, f, indent=2)
     
     print(f"\nResults saved to {results_file}")
+
+    # Save per-scene CSV (grouped scenes + std)
+    scene_csv_file = output_dir / "scene_metrics.csv"
+    with open(scene_csv_file, 'w') as f:
+        f.write("scene_id,num_episodes,fge,fge_std,cr,cr_std,plr,plr_std,curv,curv_std\n")
+        for s in scene_summary:
+            f.write(
+                f"{s.get('scene_id','')},{s.get('num_episodes','')},"
+                f"{s.get('fge','')},{s.get('fge_std','')},"
+                f"{s.get('cr','')},{s.get('cr_std','')},"
+                f"{s.get('plr','')},{s.get('plr_std','')},"
+                f"{s.get('curv','')},{s.get('curv_std','')}\n"
+            )
+    print(f"Per-scene CSV saved to {scene_csv_file}")
     
     # Save CSV
     csv_file = output_dir / "metrics.csv"
     with open(csv_file, 'w') as f:
-        f.write("episode_idx,scene_id,instruction,fge,cr,plr,curv\n")
+        f.write("episode_idx,scene_id,instruction,fge,cr,plr,curv,inference_ms\n")
         for r in results:
             instruction = r.get('instruction', '')[:50].replace(',', ' ').replace('\n', ' ')
             f.write(f"{r.get('episode_idx', '')},{r.get('scene_id', '')},{instruction},"
-                   f"{r.get('fge', '')},{r.get('cr', '')},{r.get('plr', '')},{r.get('curv', '')}\n")
+                   f"{r.get('fge', '')},{r.get('cr', '')},{r.get('plr', '')},{r.get('curv', '')},{r.get('inference_ms', '')}\n")
     
     print(f"CSV saved to {csv_file}")
 

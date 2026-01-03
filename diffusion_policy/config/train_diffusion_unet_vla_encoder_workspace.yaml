@@ -13,11 +13,11 @@ shape_meta: ${task.shape_meta}
 exp_name: "vla_nav_siglip_encoder"
 
 # Sequence parameters
-# NOTE: current unified_static_v10 dataset episodes are fixed-length 101.
+# NOTE: current unified_static_v10 dataset episodes are fixed-length 100.
 # Keep horizon aligned with the dataset length to avoid implicit padding/truncation.
-horizon: 101
+horizon: 100
 n_obs_steps: 1
-n_action_steps: 101
+n_action_steps: 100
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
@@ -91,7 +91,7 @@ optimizer:
   lr: 1.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 1.0e-6
+  weight_decay: 1.0e-5
 
 training:
   device: "cuda:0"
