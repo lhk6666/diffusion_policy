@@ -559,7 +559,7 @@ def main():
     parser.add_argument('--checkpoint', '-c', type=str, required=True,
                        help='Path to DP checkpoint')
     parser.add_argument('--dataset', type=str,
-                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v10/val',
+                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v12/val',
                        help='Path to validation Zarr dataset')
     parser.add_argument('--output_dir', '-o', type=str, default='dp_eval_results',
                        help='Output directory')
@@ -575,126 +575,182 @@ def main():
                        help='Batch size for inference (default: 32)')
     parser.add_argument('--num_inference_steps', type=int, default=None,
                        help='Override diffusion denoising steps at inference time (if supported by the policy)')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Optional random seed for reproducible evaluation')
+    parser.add_argument('--seed', type=str, default=None,
+                        help='Random seed(s): single int (e.g., 42) or comma-separated list (e.g., "1,2,3,4,5")')
     args = parser.parse_args()
 
+    # Parse seed argument
+    seeds = []
     if args.seed is not None:
-        set_seed(int(args.seed))
+        if ',' in args.seed:
+            seeds = [int(s.strip()) for s in args.seed.split(',')]
+        else:
+            seeds = [int(args.seed)]
+    else:
+        seeds = [None]
     
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load model
-    policy, cfg = load_dp_model(args.checkpoint, args.device)
-
-    # Optionally override diffusion sampling iterations.
-    # Most DiffusionPolicy implementations expose this as `policy.num_inference_steps`.
-    if args.num_inference_steps is not None:
-        if hasattr(policy, 'num_inference_steps'):
-            policy.num_inference_steps = int(args.num_inference_steps)
+    # Run evaluation for each seed
+    all_seed_results = {}
+    
+    for seed in seeds:
+        # Set seed BEFORE loading model to ensure consistent initialization
+        if seed is not None:
+            set_seed(seed)
+            print(f"\n{'='*60}")
+            print(f"Evaluating with seed={seed}")
+            print(f"{'='*60}")
         else:
-            print("Warning: policy has no attribute 'num_inference_steps'; ignoring --num_inference_steps")
-    print(f"Model loaded. Horizon: {policy.horizon}, n_action_steps: {policy.n_action_steps}")
-    if hasattr(policy, 'num_inference_steps'):
-        print(f"Inference denoising steps: {policy.num_inference_steps}")
-    
-    # Load dataset
-    print(f"\nLoading dataset from {args.dataset}")
-    dataset = DPZarrDataset(args.dataset, load_mask=True)
-    
-    num_episodes = args.num_episodes or dataset.num_episodes
-    num_episodes = min(num_episodes, dataset.num_episodes)
-    
-    print(f"\nEvaluating {num_episodes} episodes with batch_size={args.batch_size}...")
-    
-    results = []
-    all_pred_trajs = []
-    inference_ms_values: List[float] = []
-    vis_dir = output_dir / "visualizations"
-    if args.visualize_every > 0:
-        vis_dir.mkdir(exist_ok=True)
-    
-    # Batch evaluation (much faster!)
-    if not args.use_rollout:
-        # Collect all episodes first
-        all_episodes = [dataset.get_episode(idx) for idx in range(num_episodes)]
+            print(f"\n{'='*60}")
+            print(f"Evaluating without fixed seed")
+            print(f"{'='*60}")
         
-        # Process in batches
-        for batch_start in tqdm(range(0, num_episodes, args.batch_size), desc="Batches"):
-            batch_end = min(batch_start + args.batch_size, num_episodes)
-            batch_episodes = all_episodes[batch_start:batch_end]
+        # Create seed-specific output directory
+        seed_output_dir = output_dir / f"seed{seed}" if seed is not None else output_dir
+        seed_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load model (seed already set above for consistent weight initialization)
+        policy, cfg = load_dp_model(args.checkpoint, args.device)
+        
+        # Store seed for use in inference
+        current_seed = seed
+
+        # Optionally override diffusion sampling iterations.
+        # Most DiffusionPolicy implementations expose this as `policy.num_inference_steps`.
+        if args.num_inference_steps is not None:
+            if hasattr(policy, 'num_inference_steps'):
+                policy.num_inference_steps = int(args.num_inference_steps)
+            else:
+                print("Warning: policy has no attribute 'num_inference_steps'; ignoring --num_inference_steps")
+        print(f"Model loaded. Horizon: {policy.horizon}, n_action_steps: {policy.n_action_steps}")
+        if hasattr(policy, 'num_inference_steps'):
+            print(f"Inference denoising steps: {policy.num_inference_steps}")
+        
+        # Load dataset
+        print(f"\nLoading dataset from {args.dataset}")
+        dataset = DPZarrDataset(args.dataset, load_mask=True)
+        
+        num_episodes = args.num_episodes or dataset.num_episodes
+        num_episodes = min(num_episodes, dataset.num_episodes)
+        
+        print(f"\nEvaluating {num_episodes} episodes with batch_size={args.batch_size}...")
+        
+        results = []
+        all_pred_trajs = []
+        inference_ms_values: List[float] = []
+        vis_dir = seed_output_dir / "visualizations"
+        if args.visualize_every > 0:
+            vis_dir.mkdir(exist_ok=True)
+    
+        # Batch evaluation (much faster!)
+        if not args.use_rollout:
+            # Collect all episodes first
+            all_episodes = [dataset.get_episode(idx) for idx in range(num_episodes)]
             
-            # Prepare batch inputs
-            images = [ep.image for ep in batch_episodes]
-            starts = [ep.start for ep in batch_episodes]
-            instructions = [ep.instruction for ep in batch_episodes]
-            
-            # Batch inference
-            try:
-                t0 = time.perf_counter()
-                pred_trajs = predict_trajectory_batch(
-                    policy, images, starts, instructions, args.device
-                )
-                t1 = time.perf_counter()
-                per_episode_ms = float((t1 - t0) * 1000.0 / max(1, len(batch_episodes)))
-                batch_inference_ms = [per_episode_ms for _ in range(len(batch_episodes))]
-            except Exception as e:
-                print(f"Batch inference failed: {e}, falling back to single inference")
-                pred_trajs = []
-                batch_inference_ms = []
-                for ep in batch_episodes:
-                    try:
-                        t0 = time.perf_counter()
-                        traj = predict_trajectory(
-                            policy, ep.image, ep.start, ep.instruction, args.device
-                        )
-                        t1 = time.perf_counter()
-                        pred_trajs.append(traj)
-                        batch_inference_ms.append(float((t1 - t0) * 1000.0))
-                    except:
-                        pred_trajs.append(np.zeros((10, 2)))
-                        batch_inference_ms.append(float('nan'))
-            
-            # Compute metrics for each episode in batch
-            for i, (episode, pred_traj) in enumerate(zip(batch_episodes, pred_trajs)):
-                idx = batch_start + i
+            # Process in batches
+            for batch_start in tqdm(range(0, num_episodes, args.batch_size), desc="Batches"):
+                batch_end = min(batch_start + args.batch_size, num_episodes)
+                batch_episodes = all_episodes[batch_start:batch_end]
                 
-                result = {
-                    'episode_idx': episode.episode_idx,
-                    'sample_id': episode.sample_id,
-                    'scene_id': episode.scene_id,
-                    'instruction': episode.instruction,
-                    'target_category': episode.target_category,
-                    'fge': float('inf'),
-                    'cr': 0.0,
-                    'plr': 1.0,
-                    'curv': 0.0,
-                    'has_mask': episode.obstacle_mask is not None
-                }
-                if i < len(batch_inference_ms):
-                    result['inference_ms'] = float(batch_inference_ms[i])
+                # Prepare batch inputs
+                images = [ep.image for ep in batch_episodes]
+                starts = [ep.start for ep in batch_episodes]
+                instructions = [ep.instruction for ep in batch_episodes]
                 
+                # Batch inference
                 try:
-                    # Keep metrics comparable: trim prediction to GT length if needed.
-                    if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
-                        pred_traj = pred_traj[:len(episode.gt_trajectory)]
-                    metrics = TrajectoryMetrics(
-                        pred_traj=pred_traj,
-                        gt_traj=episode.gt_trajectory,
-                        goal_pos=episode.goal,
-                        obstacle_mask=episode.obstacle_mask
+                    # Re-set seed before batch inference to ensure consistent randomness
+                    if current_seed is not None:
+                        set_seed(current_seed)
+                    t0 = time.perf_counter()
+                    pred_trajs = predict_trajectory_batch(
+                        policy, images, starts, instructions, args.device
                     )
-                    result['fge'] = metrics.final_goal_error()
-                    result['cr'] = metrics.collision_rate()
-                    result['plr'] = metrics.path_length_ratio()
-                    result['curv'] = metrics.curvature()
-                    result['pred_traj_len'] = len(pred_traj)
-                    result['gt_traj_len'] = len(episode.gt_trajectory)
+                    t1 = time.perf_counter()
+                    per_episode_ms = float((t1 - t0) * 1000.0 / max(1, len(batch_episodes)))
+                    batch_inference_ms = [per_episode_ms for _ in range(len(batch_episodes))]
                 except Exception as e:
-                    result['error'] = str(e)
+                    print(f"Batch inference failed: {e}, falling back to single inference")
+                    pred_trajs = []
+                    batch_inference_ms = []
+                    for ep in batch_episodes:
+                        try:
+                            # Re-set seed before each inference to ensure consistent randomness
+                            if current_seed is not None:
+                                set_seed(current_seed)
+                            t0 = time.perf_counter()
+                            traj = predict_trajectory(
+                                policy, ep.image, ep.start, ep.instruction, args.device
+                            )
+                            t1 = time.perf_counter()
+                            pred_trajs.append(traj)
+                            batch_inference_ms.append(float((t1 - t0) * 1000.0))
+                        except:
+                            pred_trajs.append(np.zeros((10, 2)))
+                            batch_inference_ms.append(float('nan'))
                 
+                # Compute metrics for each episode in batch
+                for i, (episode, pred_traj) in enumerate(zip(batch_episodes, pred_trajs)):
+                    idx = batch_start + i
+                    
+                    result = {
+                        'episode_idx': episode.episode_idx,
+                        'sample_id': episode.sample_id,
+                        'scene_id': episode.scene_id,
+                        'instruction': episode.instruction,
+                        'target_category': episode.target_category,
+                        'fge': float('inf'),
+                        'cr': 0.0,
+                        'plr': 1.0,
+                        'curv': 0.0,
+                        'has_mask': episode.obstacle_mask is not None
+                    }
+                    if i < len(batch_inference_ms):
+                        result['inference_ms'] = float(batch_inference_ms[i])
+                    
+                    try:
+                        # Keep metrics comparable: trim prediction to GT length if needed.
+                        if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
+                            pred_traj = pred_traj[:len(episode.gt_trajectory)]
+                        metrics = TrajectoryMetrics(
+                            pred_traj=pred_traj,
+                            gt_traj=episode.gt_trajectory,
+                            goal_pos=episode.goal,
+                            obstacle_mask=episode.obstacle_mask
+                        )
+                        result['fge'] = metrics.final_goal_error()
+                        result['cr'] = metrics.collision_rate()
+                        result['plr'] = metrics.path_length_ratio()
+                        result['curv'] = metrics.curvature()
+                        result['pred_traj_len'] = len(pred_traj)
+                        result['gt_traj_len'] = len(episode.gt_trajectory)
+                    except Exception as e:
+                        result['error'] = str(e)
+                    
+                    results.append(result)
+                    all_pred_trajs.append(pred_traj)
+                    if np.isfinite(result.get('inference_ms', float('nan'))):
+                        inference_ms_values.append(float(result['inference_ms']))
+                
+                # Visualize
+                if args.visualize_every > 0 and idx % args.visualize_every == 0:
+                    try:
+                        vis_path = seed_output_dir / "visualizations" / f"episode_{idx:05d}.png"
+                        vis_path.parent.mkdir(exist_ok=True)
+                        visualize_episode(episode, pred_traj, result, vis_path)
+                    except Exception as e:
+                        print(f"Visualization failed for episode {idx}: {e}")
+        else:
+            # Rollout mode: must be sequential (receding horizon)
+            for idx in tqdm(range(num_episodes), desc="Rollout"):
+                # Re-set seed before each rollout to ensure consistent randomness
+                if current_seed is not None:
+                    set_seed(current_seed)
+                episode = dataset.get_episode(idx)
+                result, pred_traj = evaluate_episode(policy, episode, args.device, args.use_rollout)
                 results.append(result)
                 all_pred_trajs.append(pred_traj)
                 if np.isfinite(result.get('inference_ms', float('nan'))):
@@ -703,128 +759,113 @@ def main():
                 # Visualize
                 if args.visualize_every > 0 and idx % args.visualize_every == 0:
                     try:
-                        vis_path = vis_dir / f"episode_{idx:05d}.png"
+                        vis_path = seed_output_dir / "visualizations" / f"episode_{idx:05d}.png"
+                        vis_path.parent.mkdir(exist_ok=True)
                         visualize_episode(episode, pred_traj, result, vis_path)
                     except Exception as e:
                         print(f"Visualization failed for episode {idx}: {e}")
-    else:
-        # Rollout mode: must be sequential (receding horizon)
-        for idx in tqdm(range(num_episodes), desc="Rollout"):
-            episode = dataset.get_episode(idx)
-            result, pred_traj = evaluate_episode(policy, episode, args.device, args.use_rollout)
-            results.append(result)
-            all_pred_trajs.append(pred_traj)
-            if np.isfinite(result.get('inference_ms', float('nan'))):
-                inference_ms_values.append(float(result['inference_ms']))
-            
-            # Visualize
-            if args.visualize_every > 0 and idx % args.visualize_every == 0:
-                try:
-                    vis_path = vis_dir / f"episode_{idx:05d}.png"
-                    visualize_episode(episode, pred_traj, result, vis_path)
-                except Exception as e:
-                    print(f"Visualization failed for episode {idx}: {e}")
-    
-    # Compute aggregate metrics
-    valid_results = [r for r in results if r.get('fge') != float('inf')]
-    
-    fge_values = [r['fge'] for r in valid_results]
-    cr_values = [r['cr'] for r in valid_results]
-    plr_values = [r['plr'] for r in valid_results]
-    curv_values = [r['curv'] for r in valid_results]
-    mask_count = sum(1 for r in valid_results if r.get('has_mask', False))
-    valid_inference_ms = [float(r['inference_ms']) for r in valid_results if np.isfinite(r.get('inference_ms', float('nan')))]
-    
-    print("\n" + "=" * 60)
-    print("RESULTS SUMMARY - Diffusion Policy")
-    print("=" * 60)
-    print(f"Checkpoint: {args.checkpoint}")
-    print(f"Total episodes: {len(results)}")
-    print(f"Valid episodes: {len(valid_results)}")
-    print(f"Episodes with mask: {mask_count}/{len(valid_results)}")
-    print(f"\nTrajectory Metrics:")
-    print(f"  FGE  (Final Goal Error):  {np.mean(fge_values):.4f} ± {np.std(fge_values):.4f}")
-    print(f"  CR   (Collision Rate):    {np.mean(cr_values)*100:.2f}%")
-    print(f"  PLR  (Path Length Ratio): {np.mean(plr_values):.4f} ± {np.std(plr_values):.4f}")
-    print(f"  Curv (Curvature):         {np.mean(curv_values):.4f} ± {np.std(curv_values):.4f}")
-    if len(valid_inference_ms) > 0:
-        print(f"\nPerformance:")
-        print(f"  Inference latency:        {np.mean(valid_inference_ms):.2f} ms/episode ± {np.std(valid_inference_ms):.2f} ms")
+        
+        # Compute aggregate metrics
+        valid_results = [r for r in results if r.get('fge') != float('inf')]
+        
+        fge_values = [r['fge'] for r in valid_results]
+        cr_values = [r['cr'] for r in valid_results]
+        plr_values = [r['plr'] for r in valid_results]
+        curv_values = [r['curv'] for r in valid_results]
+        mask_count = sum(1 for r in valid_results if r.get('has_mask', False))
+        valid_inference_ms = [float(r['inference_ms']) for r in valid_results if np.isfinite(r.get('inference_ms', float('nan')))]
+        
+        print("\n" + "=" * 60)
+        print("RESULTS SUMMARY - Diffusion Policy")
+        print("=" * 60)
+        print(f"Checkpoint: {args.checkpoint}")
+        print(f"Total episodes: {len(results)}")
+        print(f"Valid episodes: {len(valid_results)}")
+        print(f"Episodes with mask: {mask_count}/{len(valid_results)}")
+        print(f"\nTrajectory Metrics:")
+        print(f"  FGE  (Final Goal Error):  {np.mean(fge_values):.4f} ± {np.std(fge_values):.4f}")
+        print(f"  CR   (Collision Rate):    {np.mean(cr_values)*100:.2f}%")
+        print(f"  PLR  (Path Length Ratio): {np.mean(plr_values):.4f} ± {np.std(plr_values):.4f}")
+        print(f"  Curv (Curvature):         {np.mean(curv_values):.4f} ± {np.std(curv_values):.4f}")
+        if len(valid_inference_ms) > 0:
+            print(f"\nPerformance:")
+            print(f"  Inference latency:        {np.mean(valid_inference_ms):.2f} ms/episode ± {np.std(valid_inference_ms):.2f} ms")
 
-    def scene_group_id(scene_id: str) -> str:
-        """Group scene variants like scene700_01/scene700_02 into scene700."""
-        if not scene_id:
-            return 'unknown'
-        s = str(scene_id).strip()
-        s = s.split('/')[-1].split('\\')[-1]
-        m = re.match(r'^(scene\d+)(?:[_-]\d+)?$', s)
-        if m:
-            return m.group(1)
-        parts = re.split(r'[_-]', s)
-        if parts and re.fullmatch(r'scene\d+', parts[0]):
-            return parts[0]
-        m = re.match(r'^(scene\d+)', s)
-        if m:
-            return m.group(1)
-        return s
-    
-    # Per-scene results
-    scene_results = {}
-    for r in valid_results:
-        scene_id_raw = r.get('scene_id', 'unknown')
-        scene_id = scene_group_id(scene_id_raw)
-        if scene_id not in scene_results:
-            scene_results[scene_id] = []
-        scene_results[scene_id].append(r)
-    
-    print("\n" + "=" * 60)
-    print("PER-SCENE RESULTS")
-    print("=" * 60)
-    
-    scene_summary = []
-    for scene_id, scene_res in sorted(scene_results.items()):
-        scene_fge_vals = [r['fge'] for r in scene_res]
-        scene_cr_vals = [r['cr'] for r in scene_res]
-        scene_plr_vals = [r['plr'] for r in scene_res]
-        scene_curv_vals = [r['curv'] for r in scene_res]
+        def scene_group_id(scene_id: str) -> str:
+            """Group scene variants like scene700_01/scene700_02 into scene700."""
+            if not scene_id:
+                return 'unknown'
+            s = str(scene_id).strip()
+            s = s.split('/')[-1].split('\\')[-1]
+            m = re.match(r'^(scene\d+)(?:[_-]\d+)?$', s)
+            if m:
+                return m.group(1)
+            parts = re.split(r'[_-]', s)
+            if parts and re.fullmatch(r'scene\d+', parts[0]):
+                return parts[0]
+            m = re.match(r'^(scene\d+)', s)
+            if m:
+                return m.group(1)
+            return s
+        
+        # Per-scene results
+        scene_results = {}
+        for r in valid_results:
+            scene_id_raw = r.get('scene_id', 'unknown')
+            scene_id = scene_group_id(scene_id_raw)
+            if scene_id not in scene_results:
+                scene_results[scene_id] = []
+            scene_results[scene_id].append(r)
+        
+        print("\n" + "=" * 60)
+        print("PER-SCENE RESULTS")
+        print("=" * 60)
+        
+        scene_summary = []
+        for scene_id, scene_res in sorted(scene_results.items()):
+            scene_fge_vals = [r['fge'] for r in scene_res]
+            scene_cr_vals = [r['cr'] for r in scene_res]
+            scene_plr_vals = [r['plr'] for r in scene_res]
+            scene_curv_vals = [r['curv'] for r in scene_res]
 
-        scene_fge = float(np.mean(scene_fge_vals))
-        scene_fge_std = float(np.std(scene_fge_vals))
-        scene_cr = float(np.mean(scene_cr_vals))
-        scene_cr_std = float(np.std(scene_cr_vals))
-        scene_plr = float(np.mean(scene_plr_vals))
-        scene_plr_std = float(np.std(scene_plr_vals))
-        scene_curv = float(np.mean(scene_curv_vals))
-        scene_curv_std = float(np.std(scene_curv_vals))
+            scene_fge = float(np.mean(scene_fge_vals))
+            scene_fge_std = float(np.std(scene_fge_vals))
+            scene_cr = float(np.mean(scene_cr_vals))
+            scene_cr_std = float(np.std(scene_cr_vals))
+            scene_plr = float(np.mean(scene_plr_vals))
+            scene_plr_std = float(np.std(scene_plr_vals))
+            scene_curv = float(np.mean(scene_curv_vals))
+            scene_curv_std = float(np.std(scene_curv_vals))
 
-        print(
-            f"{scene_id}: FGE={scene_fge:.4f} ± {scene_fge_std:.4f}, "
-            f"CR={scene_cr*100:.1f}% ± {scene_cr_std*100:.1f}%, "
-            f"PLR={scene_plr:.3f} ± {scene_plr_std:.3f}, "
-            f"Curv={scene_curv:.4f} ± {scene_curv_std:.4f}, N={len(scene_res)}"
-        )
-        scene_summary.append({
-            'scene_id': scene_id,
-            'fge': scene_fge,
-            'fge_std': scene_fge_std,
-            'cr': scene_cr,
-            'cr_std': scene_cr_std,
-            'plr': scene_plr,
-            'plr_std': scene_plr_std,
-            'curv': scene_curv,
-            'curv_std': scene_curv_std,
-            'num_episodes': len(scene_res)
-        })
-    
-    # Save results
-    results_file = output_dir / "results.json"
-    with open(results_file, 'w') as f:
-        json.dump({
-            'config': {
+            print(
+                f"{scene_id}: FGE={scene_fge:.4f} ± {scene_fge_std:.4f}, "
+                f"CR={scene_cr*100:.1f}% ± {scene_cr_std*100:.1f}%, "
+                f"PLR={scene_plr:.3f} ± {scene_plr_std:.3f}, "
+                f"Curv={scene_curv:.4f} ± {scene_curv_std:.4f}, N={len(scene_res)}"
+            )
+            scene_summary.append({
+                'scene_id': scene_id,
+                'fge': scene_fge,
+                'fge_std': scene_fge_std,
+                'cr': scene_cr,
+                'cr_std': scene_cr_std,
+                'plr': scene_plr,
+                'plr_std': scene_plr_std,
+                'curv': scene_curv,
+                'curv_std': scene_curv_std,
+                'num_episodes': len(scene_res)
+            })
+        
+        # Save results
+        results_file = seed_output_dir / "results.json"
+        with open(results_file, 'w') as f:
+            json.dump({
+                'config': {
                 'checkpoint': args.checkpoint,
                 'dataset': args.dataset,
                 'num_episodes': len(results),
-                'use_rollout': args.use_rollout
+                'use_rollout': args.use_rollout,
+                'seed': seed
             },
             'overall': {
                 'fge_mean': float(np.mean(fge_values)),
@@ -842,34 +883,175 @@ def main():
             'per_scene': scene_summary,
             'episode_results': results
         }, f, indent=2)
-    
-    print(f"\nResults saved to {results_file}")
+        
+        print(f"\nResults saved to {results_file}")
+        
+        # Store results for cross-seed comparison
+        all_seed_results[seed] = {
+            'fge': np.mean(fge_values),
+            'fge_std': np.std(fge_values),
+            'cr': np.mean(cr_values),
+            'plr': np.mean(plr_values),
+            'plr_std': np.std(plr_values),
+            'curv': np.mean(curv_values),
+            'curv_std': np.std(curv_values),
+            'per_scene': scene_summary  # Store per-scene results for cross-seed comparison
+        }
 
-    # Save per-scene CSV (grouped scenes + std)
-    scene_csv_file = output_dir / "scene_metrics.csv"
-    with open(scene_csv_file, 'w') as f:
-        f.write("scene_id,num_episodes,fge,fge_std,cr,cr_std,plr,plr_std,curv,curv_std\n")
-        for s in scene_summary:
-            f.write(
-                f"{s.get('scene_id','')},{s.get('num_episodes','')},"
-                f"{s.get('fge','')},{s.get('fge_std','')},"
-                f"{s.get('cr','')},{s.get('cr_std','')},"
-                f"{s.get('plr','')},{s.get('plr_std','')},"
-                f"{s.get('curv','')},{s.get('curv_std','')}\n"
-            )
-    print(f"Per-scene CSV saved to {scene_csv_file}")
+        # Save per-scene CSV (grouped scenes + std)
+        scene_csv_file = seed_output_dir / "scene_metrics.csv"
+        with open(scene_csv_file, 'w') as f:
+            f.write("scene_id,num_episodes,fge,fge_std,cr,cr_std,plr,plr_std,curv,curv_std\n")
+            for s in scene_summary:
+                f.write(
+                    f"{s.get('scene_id','')},{s.get('num_episodes','')},"
+                    f"{s.get('fge','')},{s.get('fge_std','')},"
+                    f"{s.get('cr','')},{s.get('cr_std','')},"
+                    f"{s.get('plr','')},{s.get('plr_std','')},"
+                    f"{s.get('curv','')},{s.get('curv_std','')}\n"
+                )
+        print(f"Per-scene CSV saved to {scene_csv_file}")
+        
+        # Save CSV
+        csv_file = seed_output_dir / "metrics.csv"
+        with open(csv_file, 'w') as f:
+            f.write("episode_idx,scene_id,instruction,fge,cr,plr,curv,inference_ms\n")
+            for r in results:
+                instruction = r.get('instruction', '')[:50].replace(',', ' ').replace('\n', ' ')
+                f.write(f"{r.get('episode_idx', '')},{r.get('scene_id', '')},{instruction},"
+                       f"{r.get('fge', '')},{r.get('cr', '')},{r.get('plr', '')},{r.get('curv', '')},{r.get('inference_ms', '')}\n")
+        
+        print(f"CSV saved to {csv_file}")
     
-    # Save CSV
-    csv_file = output_dir / "metrics.csv"
-    with open(csv_file, 'w') as f:
-        f.write("episode_idx,scene_id,instruction,fge,cr,plr,curv,inference_ms\n")
-        for r in results:
-            instruction = r.get('instruction', '')[:50].replace(',', ' ').replace('\n', ' ')
-            f.write(f"{r.get('episode_idx', '')},{r.get('scene_id', '')},{instruction},"
-                   f"{r.get('fge', '')},{r.get('cr', '')},{r.get('plr', '')},{r.get('curv', '')},{r.get('inference_ms', '')}\n")
-    
-    print(f"CSV saved to {csv_file}")
-
+    # Print cross-seed comparison if multiple seeds
+    if len(seeds) > 1:
+        print("\n" + "="*70)
+        print("CROSS-SEED RESULTS COMPARISON (GLOBAL)")
+        print("="*70)
+        print(f"{'Seed':<8} {'FGE':<12} {'CR (%)':<12} {'PLR':<12} {'Curv':<12}")
+        print("-"*70)
+        
+        # Aggregate across all seeds
+        all_fge = []
+        all_cr = []
+        all_plr = []
+        all_curv = []
+        
+        for s in sorted(all_seed_results.keys(), key=lambda x: x if x is not None else -1):
+            res = all_seed_results[s]
+            seed_label = f"seed{s}" if s is not None else "no_seed"
+            print(f"{seed_label:<8} {res['fge']:<12.4f} {res['cr']*100:<12.2f} {res['plr']:<12.4f} {res['curv']:<12.4f}")
+            all_fge.append(res['fge'])
+            all_cr.append(res['cr'])
+            all_plr.append(res['plr'])
+            all_curv.append(res['curv'])
+        
+        print("-"*70)
+        print(f"{'Mean':<8} {np.mean(all_fge):<12.4f} {np.mean(all_cr)*100:<12.2f} {np.mean(all_plr):<12.4f} {np.mean(all_curv):<12.4f}")
+        print(f"{'Std':<8} {np.std(all_fge):<12.4f} {np.std(all_cr)*100:<12.2f} {np.std(all_plr):<12.4f} {np.std(all_curv):<12.4f}")
+        print("="*70)
+        
+        # Build per-scene seed comparison
+        per_scene_seed_comparison = {}
+        
+        # Collect all unique scene IDs across all seeds
+        all_scene_ids = set()
+        for s in all_seed_results.keys():
+            if 'per_scene' in all_seed_results[s]:
+                for scene_data in all_seed_results[s]['per_scene']:
+                    all_scene_ids.add(scene_data['scene_id'])
+        
+        all_scene_ids = sorted(list(all_scene_ids))
+        
+        # For each scene, build cross-seed comparison
+        for scene_id in all_scene_ids:
+            scene_comparison = {}
+            scene_fge_vals = []
+            scene_cr_vals = []
+            scene_plr_vals = []
+            scene_curv_vals = []
+            
+            for s in sorted(all_seed_results.keys(), key=lambda x: x if x is not None else -1):
+                if 'per_scene' in all_seed_results[s]:
+                    scene_data = None
+                    for data in all_seed_results[s]['per_scene']:
+                        if data['scene_id'] == scene_id:
+                            scene_data = data
+                            break
+                    
+                    if scene_data:
+                        seed_label = f"seed{s}" if s is not None else "no_seed"
+                        scene_comparison[seed_label] = {
+                            'fge': scene_data['fge'],
+                            'cr': scene_data['cr'],
+                            'plr': scene_data['plr'],
+                            'curv': scene_data['curv'],
+                            'num_episodes': scene_data['num_episodes']
+                        }
+                        scene_fge_vals.append(scene_data['fge'])
+                        scene_cr_vals.append(scene_data['cr'])
+                        scene_plr_vals.append(scene_data['plr'])
+                        scene_curv_vals.append(scene_data['curv'])
+            
+            # Compute aggregates for this scene
+            if scene_fge_vals:
+                scene_comparison['aggregate'] = {
+                    'fge_mean': float(np.mean(scene_fge_vals)),
+                    'fge_std': float(np.std(scene_fge_vals)),
+                    'cr_mean': float(np.mean(scene_cr_vals)),
+                    'cr_std': float(np.std(scene_cr_vals)),
+                    'plr_mean': float(np.mean(scene_plr_vals)),
+                    'plr_std': float(np.std(scene_plr_vals)),
+                    'curv_mean': float(np.mean(scene_curv_vals)),
+                    'curv_std': float(np.std(scene_curv_vals))
+                }
+                per_scene_seed_comparison[scene_id] = scene_comparison
+        
+        # Print per-scene seed comparisons
+        print("\n" + "="*70)
+        print("PER-SCENE CROSS-SEED COMPARISON")
+        print("="*70)
+        for scene_id in all_scene_ids:
+            if scene_id in per_scene_seed_comparison:
+                scene_comp = per_scene_seed_comparison[scene_id]
+                print(f"\nSCENE: {scene_id}")
+                print(f"{'Seed':<12} {'FGE':<12} {'CR (%)':<12} {'PLR':<12} {'Curv':<12}")
+                print("-"*70)
+                
+                for s in sorted(all_seed_results.keys(), key=lambda x: x if x is not None else -1):
+                    seed_label = f"seed{s}" if s is not None else "no_seed"
+                    if seed_label in scene_comp:
+                        data = scene_comp[seed_label]
+                        print(f"{seed_label:<12} {data['fge']:<12.4f} {data['cr']*100:<12.2f} {data['plr']:<12.4f} {data['curv']:<12.4f}")
+                
+                agg = scene_comp.get('aggregate', {})
+                print("-"*70)
+                if agg:
+                    print(f"{'Mean':<12} {agg.get('fge_mean', 0):<12.4f} {agg.get('cr_mean', 0)*100:<12.2f} {agg.get('plr_mean', 0):<12.4f} {agg.get('curv_mean', 0):<12.4f}")
+                    print(f"{'Std':<12} {agg.get('fge_std', 0):<12.4f} {agg.get('cr_std', 0)*100:<12.2f} {agg.get('plr_std', 0):<12.4f} {agg.get('curv_std', 0):<12.4f}")
+        
+        print("="*70)
+        
+        # Save cross-seed summary
+        summary_file = output_dir / "cross_seed_summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump({
+                'seeds_tested': [s for s in seeds],
+                'num_seeds': len(seeds),
+                'seed_results': all_seed_results,
+                'aggregate': {
+                    'fge_mean': float(np.mean(all_fge)),
+                    'fge_std': float(np.std(all_fge)),
+                    'cr_mean': float(np.mean(all_cr)),
+                    'cr_std': float(np.std(all_cr)),
+                    'plr_mean': float(np.mean(all_plr)),
+                    'plr_std': float(np.std(all_plr)),
+                    'curv_mean': float(np.mean(all_curv)),
+                    'curv_std': float(np.std(all_curv))
+                },
+                'per_scene_seed_comparison': per_scene_seed_comparison
+            }, f, indent=2)
+        print(f"\nCross-seed summary saved to {summary_file}")
 
 if __name__ == "__main__":
     main()
