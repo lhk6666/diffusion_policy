@@ -157,7 +157,10 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
-                        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                        batch = dict_apply(
+                            batch,
+                            lambda x: x.to(device, non_blocking=True) if hasattr(x, 'to') else x,
+                        )
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
@@ -222,7 +225,10 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                                batch = dict_apply(
+                                    batch,
+                                    lambda x: x.to(device, non_blocking=True) if hasattr(x, 'to') else x,
+                                )
                                 loss = self.model.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
@@ -237,7 +243,10 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.sample_every) == 0:
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
-                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                        batch = dict_apply(
+                            train_sampling_batch,
+                            lambda x: x.to(device, non_blocking=True) if hasattr(x, 'to') else x,
+                        )
                         obs_dict = batch['obs']
                         gt_action = batch['action']
                         

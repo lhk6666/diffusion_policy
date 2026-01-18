@@ -1,0 +1,21 @@
+# VLA Navigation (lowdim) Task Configuration
+# Uses agent_pos as low-dimensional observation for transformer-lowdim policies.
+
+name: vla_nav_lowdim
+
+obs_dim: 2
+action_dim: 2
+
+env_runner:
+  _target_: diffusion_policy.env_runner.base_lowdim_runner.BaseLowdimRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.vla_nav_lowdim_dataset.VLANavLowdimDatasetFromPath
+  train_path: /media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/train/dataset.zarr
+  val_path: /media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/val/dataset.zarr
+  horizon: ${horizon}
+  pad_before: 0
+  pad_after: 0
+  seed: 42
+  max_train_episodes: null
+  sample_mode: episode  # keep VLA-like behavior

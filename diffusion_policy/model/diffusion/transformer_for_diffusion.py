@@ -14,6 +14,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             horizon: int,
             n_obs_steps: int = None,
             cond_dim: int = 0,
+            max_cond_tokens: Optional[int] = None,
             n_layer: int = 12,
             n_head: int = 12,
             n_emb: int = 768,
@@ -22,7 +23,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             causal_attn: bool=False,
             time_as_cond: bool=True,
             obs_as_cond: bool=False,
-            n_cond_layers: int = 0
+            n_cond_layers: int = 0,
+            cond_causal_mask: bool = True,
         ) -> None:
         super().__init__()
 
@@ -38,7 +40,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         obs_as_cond = cond_dim > 0
         if obs_as_cond:
             assert time_as_cond
-            T_cond += n_obs_steps
+            if max_cond_tokens is None:
+                max_cond_tokens = n_obs_steps
+            if max_cond_tokens <= 0:
+                raise ValueError(f"max_cond_tokens must be positive, got {max_cond_tokens}.")
+            T_cond += max_cond_tokens
+        else:
+            max_cond_tokens = 0
 
         # input embedding stem
         self.input_emb = nn.Linear(input_dim, n_emb)
@@ -120,7 +128,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
             self.register_buffer("mask", mask)
             
-            if time_as_cond and obs_as_cond:
+            if time_as_cond and obs_as_cond and cond_causal_mask:
                 S = T_cond
                 t, s = torch.meshgrid(
                     torch.arange(T),
@@ -147,6 +155,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.time_as_cond = time_as_cond
         self.obs_as_cond = obs_as_cond
         self.encoder_only = encoder_only
+        self.max_cond_tokens = int(max_cond_tokens) if max_cond_tokens is not None else 0
+        self.cond_causal_mask = bool(cond_causal_mask)
 
         # init
         self.apply(self._init_weights)
@@ -274,7 +284,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
-        cond: (B,T',cond_dim)
+        cond: (B,N,cond_dim) where N can be different from n_obs_steps
         output: (B,T,input_dim)
         """
         # 1. time
@@ -309,8 +319,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
             # encoder
             cond_embeddings = time_emb
             if self.obs_as_cond:
+                if cond is None:
+                    raise ValueError("cond must be provided when obs_as_cond=True")
+                if cond.ndim != 3:
+                    raise ValueError(f"Expected cond to have shape (B,N,cond_dim), got {tuple(cond.shape)}")
+                if self.max_cond_tokens > 0 and cond.shape[1] > self.max_cond_tokens:
+                    raise ValueError(
+                        f"cond token length N={cond.shape[1]} exceeds max_cond_tokens={self.max_cond_tokens}"
+                    )
                 cond_obs_emb = self.cond_obs_emb(cond)
-                # (B,To,n_emb)
+                # (B,N,n_emb)
                 cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
             tc = cond_embeddings.shape[1]
             position_embeddings = self.cond_pos_emb[
@@ -333,7 +351,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 tgt=x,
                 memory=memory,
                 tgt_mask=self.mask,
-                memory_mask=self.memory_mask
+                memory_mask=(self.memory_mask[:, :tc] if torch.is_tensor(self.memory_mask) else None)
             )
             # (B,T,n_emb)
         

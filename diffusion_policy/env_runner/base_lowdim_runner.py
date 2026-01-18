@@ -6,4 +6,6 @@ class BaseLowdimRunner:
         self.output_dir = output_dir
 
     def run(self, policy: BaseLowdimPolicy) -> Dict:
-        raise NotImplementedError()
+        # Default implementation returns empty dict (no simulation environment).
+        # Override this method for tasks with actual environments.
+        return {}
