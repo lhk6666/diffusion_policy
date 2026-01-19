@@ -49,6 +49,7 @@ class VLANavDataset(BaseImageDataset):
         horizon: int = 16,
         pad_before: int = 1,
         pad_after: int = 7,
+        stride: int = 1,
         seed: int = 42,
         val_ratio: float = 0.0,
         max_train_episodes: Optional[int] = None,
@@ -61,6 +62,9 @@ class VLANavDataset(BaseImageDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        if stride < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+        self.stride = int(stride)
         self.sequence_length = horizon
         self.sample_mode = sample_mode
         self.cache_images = cache_images
@@ -152,15 +156,23 @@ class VLANavDataset(BaseImageDataset):
                 # Episode mode: one sample per episode, always start from 0
                 self.indices.append((ep_idx, 0))
             else:
-                # Sliding window mode: all valid starting positions
+                # Sliding window mode: valid starting positions with configurable stride.
+                # This matches DP's `SequenceSampler.create_indices` semantics:
+                #   idx in [min_start, max_start] where
+                #   min_start = -pad_before
+                #   max_start = episode_length - sequence_length + pad_after
                 ep_start = self.episode_starts[ep_idx]
                 ep_end = self.episode_ends[ep_idx]
                 ep_len = ep_end - ep_start
-                
-                # Generate all valid starting positions
-                max_start = ep_len - self.sequence_length + self.pad_before + self.pad_after
-                
-                for i in range(max(1, max_start)):
+
+                min_start = -self.pad_before
+                max_start = ep_len - self.sequence_length + self.pad_after
+                # Ensure at least one sample per episode even in edge cases.
+                if max_start < min_start:
+                    self.indices.append((ep_idx, 0))
+                    continue
+
+                for i in range(min_start, max_start + 1, self.stride):
                     self.indices.append((ep_idx, i))
     
     def get_validation_dataset(self):
@@ -305,6 +317,7 @@ class VLANavDatasetFromPath(VLANavDataset):
         horizon: int = 16,
         pad_before: int = 1,
         pad_after: int = 7,
+        stride: int = 1,
         seed: int = 42,
         max_train_episodes: Optional[int] = None,
         sample_mode: str = 'sliding_window',  # 'sliding_window' or 'episode'
@@ -317,6 +330,7 @@ class VLANavDatasetFromPath(VLANavDataset):
             horizon=horizon,
             pad_before=pad_before,
             pad_after=pad_after,
+            stride=stride,
             seed=seed,
             val_ratio=0.0,
             max_train_episodes=max_train_episodes,
@@ -341,6 +355,7 @@ class VLANavDatasetFromPath(VLANavDataset):
             horizon=self.horizon,
             pad_before=self.pad_before,
             pad_after=self.pad_after,
+            stride=self.stride,
             seed=42,
             val_ratio=0.0,
             max_train_episodes=None,

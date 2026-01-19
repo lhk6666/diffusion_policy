@@ -15,9 +15,9 @@ exp_name: "vla_nav_siglip_encoder"
 # Sequence parameters
 # NOTE: current unified_static_v10 dataset episodes are fixed-length 100.
 # Keep horizon aligned with the dataset length to avoid implicit padding/truncation.
-horizon: 100
+horizon: 20
 n_obs_steps: 1
-n_action_steps: 100
+n_action_steps: 20
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False

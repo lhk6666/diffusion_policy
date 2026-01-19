@@ -27,9 +27,12 @@ dataset:
   horizon: ${horizon}
   pad_before: 0
   pad_after: 0
+  # Only used when sample_mode: sliding_window.
+  # stride=1 enumerates every possible start index; larger stride reduces overlap.
+  stride: 20
   seed: 42
   max_train_episodes: null
-  sample_mode: episode  # 'episode' for VLA-like behavior, 'sliding_window' for standard DP
+  sample_mode: sliding_window  # 'episode' for VLA-like behavior, 'sliding_window' for standard DP
   cache_images: true  # Load all images into RAM for faster training (requires ~20GB RAM)
 
 # Environment runner (minimal - our task doesn't use simulation)

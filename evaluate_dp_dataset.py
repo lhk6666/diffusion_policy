@@ -559,7 +559,7 @@ def main():
     parser.add_argument('--checkpoint', '-c', type=str, required=True,
                        help='Path to DP checkpoint')
     parser.add_argument('--dataset', type=str,
-                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v12/val',
+                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/val',
                        help='Path to validation Zarr dataset')
     parser.add_argument('--output_dir', '-o', type=str, default='dp_eval_results',
                        help='Output directory')
