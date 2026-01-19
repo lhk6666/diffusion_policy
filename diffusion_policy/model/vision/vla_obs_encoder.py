@@ -340,7 +340,10 @@ class VLAObsEncoderTokens(ModuleAttrMixin):
     Notes:
     - This is intended for token-level conditioning (e.g., cross-attention memory),
       not for producing a single pooled feature vector.
-    - Low-dim inputs are ignored by default to keep `cond_dim=d_model` clean.
+        - By default, low-dim inputs are ignored to keep `cond_dim=d_model` clean.
+            Exception: if `agent_pos` exists in `shape_meta` and is provided in `obs_dict`,
+            it will be injected as a *single extra token* (projected to `d_model`) to match
+            the previous pooled+concat conditioning behavior.
     """
 
     def __init__(
@@ -361,6 +364,10 @@ class VLAObsEncoderTokens(ModuleAttrMixin):
         self.d_model = d_model
         self.default_text = default_text
 
+        # Optional: agent_pos -> token injection
+        self.agent_pos_key: Optional[str] = None
+        self.agent_pos_proj: Optional[nn.Linear] = None
+
         # Parse shape meta
         self.rgb_keys: List[str] = []
         obs_shape_meta = shape_meta['obs']
@@ -368,6 +375,10 @@ class VLAObsEncoderTokens(ModuleAttrMixin):
             obs_type = attr.get('type', 'low_dim')
             if obs_type == 'rgb':
                 self.rgb_keys.append(key)
+            elif obs_type == 'low_dim' and key == 'agent_pos':
+                shape = tuple(attr.get('shape', []))
+                if len(shape) == 1 and int(shape[0]) == 2:
+                    self.agent_pos_key = key
         self.rgb_keys = sorted(self.rgb_keys)
         if len(self.rgb_keys) == 0:
             raise ValueError("VLAObsEncoderTokens requires at least one rgb observation key")
@@ -380,6 +391,9 @@ class VLAObsEncoderTokens(ModuleAttrMixin):
             num_heads=num_heads,
             num_fusion_layers=num_fusion_layers,
         )
+
+        if self.agent_pos_key is not None:
+            self.agent_pos_proj = nn.Linear(2, d_model)
 
     @staticmethod
     def _expand_list_to_batch(texts: Sequence[str], target_batch: int) -> List[str]:
@@ -450,6 +464,17 @@ class VLAObsEncoderTokens(ModuleAttrMixin):
                 context = context.unsqueeze(1)
             elif context.ndim != 3:
                 raise RuntimeError(f"Unexpected encoder context shape: {tuple(context.shape)}")
+
+            # Inject agent_pos as an extra token (if present).
+            if self.agent_pos_key is not None and self.agent_pos_proj is not None:
+                agent_pos = obs_dict.get(self.agent_pos_key, None)
+                if torch.is_tensor(agent_pos):
+                    if agent_pos.shape[0] != batch_size or agent_pos.shape[-1] != 2:
+                        raise ValueError(
+                            f"Expected {self.agent_pos_key} with shape (B,2) where B={batch_size}, got {tuple(agent_pos.shape)}"
+                        )
+                    agent_token = self.agent_pos_proj(agent_pos).unsqueeze(1)
+                    context = torch.cat([agent_token, context], dim=1)
             token_batches.append(context)
 
         if len(token_batches) == 1:
