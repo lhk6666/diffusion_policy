@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 import re
 import time
+import math
+import contextlib
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -41,6 +43,45 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _episode_noise_seed(base_seed: int, episode_idx: int) -> int:
+    # Derive a stable per-episode seed without relying on global RNG state.
+    mixed = (int(base_seed) + 1) * 1000003 + int(episode_idx) * 10007
+    return int(mixed & 0x7FFFFFFF)
+
+
+def _cuda_device_index(device_str: str) -> Optional[int]:
+    if not isinstance(device_str, str):
+        return None
+    if not device_str.startswith('cuda'):
+        return None
+    if ':' in device_str:
+        try:
+            return int(device_str.split(':', 1)[1])
+        except Exception:
+            return None
+    return 0
+
+
+@contextlib.contextmanager
+def _fixed_torch_rng(noise_seed: Optional[int], device: str):
+    """Run code with a deterministic torch RNG stream without polluting global RNG."""
+    if noise_seed is None:
+        yield
+        return
+
+    devices: List[int] = []
+    if torch.cuda.is_available() and isinstance(device, str) and device.startswith('cuda'):
+        idx = _cuda_device_index(device)
+        if idx is not None:
+            devices = [idx]
+
+    with torch.random.fork_rng(devices=devices, enabled=True):
+        torch.manual_seed(int(noise_seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(noise_seed))
+        yield
 
 # Add diffusion_policy to path
 script_dir = Path(__file__).resolve().parent
@@ -309,7 +350,8 @@ def load_dp_model(checkpoint_path: str, device: str = 'cuda:0'):
 
 def predict_trajectory(policy, image: np.ndarray, start_pos: np.ndarray, 
                        instruction: str = None,
-                       device: str = 'cuda:0', horizon: int = 100) -> np.ndarray:
+                       device: str = 'cuda:0', horizon: int = 100,
+                       noise_seed: Optional[int] = None) -> np.ndarray:
     """
     Predict trajectory using Diffusion Policy (single sample).
     
@@ -341,8 +383,9 @@ def predict_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
     if instruction is not None:
         obs_dict['text'] = [instruction]  # Must be a list for batch processing
     # Predict action sequence
-    with torch.no_grad():
-        result = policy.predict_action(obs_dict)
+    with _fixed_torch_rng(noise_seed, device):
+        with torch.no_grad():
+            result = policy.predict_action(obs_dict)
     
     action = result['action'].cpu().numpy()[0]  # (horizon, 2)
     
@@ -353,8 +396,104 @@ def predict_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
     return trajectory
 
 
+def predict_trajectory_receding_with_timing(
+    policy,
+    image: np.ndarray,
+    start_pos: np.ndarray,
+    instruction: Optional[str] = None,
+    device: str = 'cuda:0',
+    horizon: int = 100,
+    k: int = 5,
+    noise_seed: Optional[int] = None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Generate a fixed-length trajectory via receding-horizon replanning.
+
+    This is an offline RH stitcher (no env rollout):
+    - Each replan call generates a full plan (prefer `action_pred` when available).
+    - We append only a prefix each time to avoid tail-horizon errors.
+    - We update the conditioning start to the last appended point.
+
+    Returns:
+        full_traj: (T,2) stitched trajectory
+        timing: dict with first_plan_ms, total_ms, num_replans
+    """
+    k_int = int(k)
+    if k_int <= 0:
+        raise ValueError(f"k must be a positive integer, got {k!r}")
+
+    T = int(horizon)
+    chunk_len = int(max(1, math.ceil(T / k_int)))
+
+    img_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+    img_tensor = img_tensor.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,3,H,W)
+
+    segments: List[np.ndarray] = []
+    num_replans = 0
+    first_plan_ms: Optional[float] = None
+    t_total0 = time.perf_counter()
+
+    current_pos = np.asarray(start_pos, dtype=np.float32)
+
+    while True:
+        already = sum(seg.shape[0] for seg in segments)
+        remaining = T - already
+        if remaining <= 0:
+            break
+
+        state_tensor = torch.from_numpy(current_pos).float().unsqueeze(0).unsqueeze(0).to(device)  # (1,1,2)
+        obs_dict = {
+            'image': img_tensor,
+            'agent_pos': state_tensor,
+        }
+        if instruction is not None:
+            obs_dict['text'] = [instruction]
+
+        t0 = time.perf_counter()
+        with _fixed_torch_rng(noise_seed, device):
+            with torch.no_grad():
+                result = policy.predict_action(obs_dict)
+        t1 = time.perf_counter()
+        if first_plan_ms is None:
+            first_plan_ms = float((t1 - t0) * 1000.0)
+
+        plan_tensor = result.get('action_pred', None)
+        if plan_tensor is None:
+            plan_tensor = result['action']
+        plan = plan_tensor.detach().cpu().numpy()[0]  # (H,2) or (n_action_steps,2)
+        if plan.ndim != 2 or plan.shape[-1] != 2 or plan.shape[0] < 1:
+            raise RuntimeError(f"Unexpected plan shape: {plan.shape}")
+
+        take = min(chunk_len, remaining)
+        if plan.shape[0] < take:
+            # Pad with last predicted point if the plan is shorter than required.
+            pad = np.repeat(plan[-1:,:], take - plan.shape[0], axis=0)
+            plan = np.concatenate([plan, pad], axis=0)
+
+        append = plan[:take]
+        segments.append(append)
+        num_replans += 1
+
+        current_pos = append[-1].astype(np.float32)
+
+    full = np.concatenate(segments, axis=0) if segments else np.zeros((T, 2), dtype=np.float32)
+    if full.shape[0] < T:
+        pad_val = full[-1:] if full.shape[0] > 0 else np.zeros((1, 2), dtype=np.float32)
+        full = np.concatenate([full, np.repeat(pad_val, T - full.shape[0], axis=0)], axis=0)
+    if full.shape[0] > T:
+        full = full[:T]
+
+    total_ms = float((time.perf_counter() - t_total0) * 1000.0)
+    timing = {
+        'first_plan_ms': float(first_plan_ms) if first_plan_ms is not None else float('nan'),
+        'total_ms': total_ms,
+        'num_replans': float(num_replans),
+    }
+    return full, timing
+
+
 def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: List[np.ndarray],
-                             instructions: List[str], device: str = 'cuda:0') -> List[np.ndarray]:
+                             instructions: List[str], device: str = 'cuda:0',
+                             noise_seed: Optional[int] = None) -> List[np.ndarray]:
     """
     Predict trajectories for a batch of samples (much faster than single inference).
     
@@ -391,8 +530,9 @@ def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: 
     }
     
     # Batch predict
-    with torch.no_grad():
-        result = policy.predict_action(obs_dict)
+    with _fixed_torch_rng(noise_seed, device):
+        with torch.no_grad():
+            result = policy.predict_action(obs_dict)
     
     actions = result['action'].cpu().numpy()  # (B, horizon, 2)
     
@@ -404,7 +544,8 @@ def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: 
 def rollout_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
                        goal_pos: np.ndarray, device: str = 'cuda:0',
                        instruction: str = None,
-                       max_steps: int = 200, goal_threshold: float = 0.05) -> np.ndarray:
+                       max_steps: int = 200, goal_threshold: float = 0.05,
+                       noise_seed: Optional[int] = None) -> np.ndarray:
     """
     Rollout trajectory with receding horizon control until reaching goal.
     
@@ -443,8 +584,9 @@ def rollout_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
         if instruction is not None:
             obs_dict['text'] = [instruction]
         
-        with torch.no_grad():
-            result = policy.predict_action(obs_dict)
+        with _fixed_torch_rng(noise_seed, device):
+            with torch.no_grad():
+                result = policy.predict_action(obs_dict)
         
         actions = result['action'].cpu().numpy()[0]  # (horizon, 2)
         
@@ -461,7 +603,8 @@ def rollout_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
 
 
 def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
-                     use_rollout: bool = False) -> Dict[str, Any]:
+                     use_rollout: bool = False,
+                     noise_seed: Optional[int] = None) -> Dict[str, Any]:
     """Evaluate single episode."""
     result = {
         'episode_idx': episode.episode_idx,
@@ -482,14 +625,16 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
             pred_traj = rollout_trajectory(
                 policy, episode.image, episode.start, episode.goal,
                 instruction=episode.instruction,  # Pass instruction!
-                device=device, max_steps=200
+                device=device, max_steps=200,
+                noise_seed=noise_seed,
             )
         else:
             # Single-shot prediction
             pred_traj = predict_trajectory(
                 policy, episode.image, episode.start,
                 instruction=episode.instruction,  # Pass instruction!
-                device=device, horizon=len(episode.gt_trajectory)
+                device=device, horizon=len(episode.gt_trajectory),
+                noise_seed=noise_seed,
             )
         t1 = time.perf_counter()
         result['inference_ms'] = float((t1 - t0) * 1000.0)
@@ -569,6 +714,8 @@ def main():
                        help='Device to use')
     parser.add_argument('--use_rollout', action='store_true',
                        help='Use receding horizon rollout instead of single-shot')
+    parser.add_argument('--k', type=int, default=None,
+                       help='If set, use offline receding-horizon replanning (no env rollout) and stitch a full trajectory by executing 1/k per plan; metrics are computed on the stitched full trajectory.')
     parser.add_argument('--visualize_every', type=int, default=1000,
                        help='Visualize every N episodes (0 = disabled)')
     parser.add_argument('--batch_size', type=int, default=32,
@@ -644,58 +791,26 @@ def main():
         vis_dir = seed_output_dir / "visualizations"
         if args.visualize_every > 0:
             vis_dir.mkdir(exist_ok=True)
+
+        first_plan_ms_values: List[float] = []
+        total_ms_values: List[float] = []
     
-        # Batch evaluation (much faster!)
-        if not args.use_rollout:
-            # Collect all episodes first
+        # If args.k is set, use receding-horizon replanning per episode (timings differ, batching disabled).
+        if args.k is not None:
             all_episodes = [dataset.get_episode(idx) for idx in range(num_episodes)]
-            
-            # Process in batches
-            for batch_start in tqdm(range(0, num_episodes, args.batch_size), desc="Batches"):
-                batch_end = min(batch_start + args.batch_size, num_episodes)
-                batch_episodes = all_episodes[batch_start:batch_end]
-                
-                # Prepare batch inputs
-                images = [ep.image for ep in batch_episodes]
-                starts = [ep.start for ep in batch_episodes]
-                instructions = [ep.instruction for ep in batch_episodes]
-                
-                # Batch inference
+            for idx, episode in enumerate(tqdm(all_episodes, desc="Episodes (receding)")):
                 try:
-                    # Re-set seed before batch inference to ensure consistent randomness
-                    if current_seed is not None:
-                        set_seed(current_seed)
-                    t0 = time.perf_counter()
-                    pred_trajs = predict_trajectory_batch(
-                        policy, images, starts, instructions, args.device
+                    noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx)) if current_seed is not None else None
+                    pred_traj, timing = predict_trajectory_receding_with_timing(
+                        policy=policy,
+                        image=episode.image,
+                        start_pos=episode.start,
+                        instruction=episode.instruction,
+                        device=args.device,
+                        horizon=len(episode.gt_trajectory),
+                        k=int(args.k),
+                        noise_seed=noise_seed,
                     )
-                    t1 = time.perf_counter()
-                    per_episode_ms = float((t1 - t0) * 1000.0 / max(1, len(batch_episodes)))
-                    batch_inference_ms = [per_episode_ms for _ in range(len(batch_episodes))]
-                except Exception as e:
-                    print(f"Batch inference failed: {e}, falling back to single inference")
-                    pred_trajs = []
-                    batch_inference_ms = []
-                    for ep in batch_episodes:
-                        try:
-                            # Re-set seed before each inference to ensure consistent randomness
-                            if current_seed is not None:
-                                set_seed(current_seed)
-                            t0 = time.perf_counter()
-                            traj = predict_trajectory(
-                                policy, ep.image, ep.start, ep.instruction, args.device
-                            )
-                            t1 = time.perf_counter()
-                            pred_trajs.append(traj)
-                            batch_inference_ms.append(float((t1 - t0) * 1000.0))
-                        except:
-                            pred_trajs.append(np.zeros((10, 2)))
-                            batch_inference_ms.append(float('nan'))
-                
-                # Compute metrics for each episode in batch
-                for i, (episode, pred_traj) in enumerate(zip(batch_episodes, pred_trajs)):
-                    idx = batch_start + i
-                    
                     result = {
                         'episode_idx': episode.episode_idx,
                         'sample_id': episode.sample_id,
@@ -706,20 +821,112 @@ def main():
                         'cr': 0.0,
                         'plr': 1.0,
                         'curv': 0.0,
-                        'has_mask': episode.obstacle_mask is not None
+                        'has_mask': episode.obstacle_mask is not None,
+                        'first_plan_ms': float(timing.get('first_plan_ms', float('nan'))),
+                        'total_ms': float(timing.get('total_ms', float('nan'))),
+                        'num_replans': float(timing.get('num_replans', float('nan'))),
+                        # Keep existing field name for summary compatibility
+                        'inference_ms': float(timing.get('total_ms', float('nan'))),
                     }
-                    if i < len(batch_inference_ms):
-                        result['inference_ms'] = float(batch_inference_ms[i])
-                    
+                except Exception as e:
+                    pred_traj = np.zeros((len(episode.gt_trajectory), 2), dtype=np.float32)
+                    result = {
+                        'episode_idx': episode.episode_idx,
+                        'sample_id': episode.sample_id,
+                        'scene_id': episode.scene_id,
+                        'instruction': episode.instruction,
+                        'target_category': episode.target_category,
+                        'fge': float('inf'),
+                        'cr': 0.0,
+                        'plr': 1.0,
+                        'curv': 0.0,
+                        'has_mask': episode.obstacle_mask is not None,
+                        'error': str(e),
+                        'first_plan_ms': float('nan'),
+                        'total_ms': float('nan'),
+                        'num_replans': float('nan'),
+                        'inference_ms': float('nan'),
+                    }
+
+                try:
+                    metrics = TrajectoryMetrics(
+                        pred_traj=pred_traj,
+                        gt_traj=episode.gt_trajectory,
+                        goal_pos=episode.goal,
+                        obstacle_mask=episode.obstacle_mask,
+                    )
+                    result['fge'] = metrics.final_goal_error()
+                    result['cr'] = metrics.collision_rate()
+                    result['plr'] = metrics.path_length_ratio()
+                    result['curv'] = metrics.curvature()
+                    result['pred_traj_len'] = int(len(pred_traj))
+                    result['gt_traj_len'] = int(len(episode.gt_trajectory))
+                except Exception as e:
+                    result['error'] = str(e)
+
+                results.append(result)
+                all_pred_trajs.append(pred_traj)
+                if np.isfinite(result.get('inference_ms', float('nan'))):
+                    inference_ms_values.append(float(result['inference_ms']))
+                if np.isfinite(result.get('first_plan_ms', float('nan'))):
+                    first_plan_ms_values.append(float(result['first_plan_ms']))
+                if np.isfinite(result.get('total_ms', float('nan'))):
+                    total_ms_values.append(float(result['total_ms']))
+
+                if args.visualize_every > 0 and idx % args.visualize_every == 0:
                     try:
-                        # Keep metrics comparable: trim prediction to GT length if needed.
-                        if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
-                            pred_traj = pred_traj[:len(episode.gt_trajectory)]
+                        vis_path = seed_output_dir / "visualizations" / f"episode_{idx:05d}.png"
+                        vis_path.parent.mkdir(exist_ok=True)
+                        visualize_episode(episode, pred_traj, result, vis_path)
+                    except Exception as e:
+                        print(f"Visualization failed for episode {idx}: {e}")
+
+        # Batch evaluation (much faster!)
+        elif not args.use_rollout:
+            # Collect all episodes first
+            all_episodes = [dataset.get_episode(idx) for idx in range(num_episodes)]
+
+            # If a base seed is set, do deterministic per-episode evaluation.
+            # (Per-sample deterministic noise isn't possible in a single batched DP call.)
+            if current_seed is not None:
+                for idx, episode in enumerate(tqdm(all_episodes, desc="Episodes (seeded)")):
+                    noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx))
+                    t0 = time.perf_counter()
+                    pred_traj = predict_trajectory(
+                        policy,
+                        episode.image,
+                        episode.start,
+                        instruction=episode.instruction,
+                        device=args.device,
+                        horizon=len(episode.gt_trajectory),
+                        noise_seed=noise_seed,
+                    )
+                    t1 = time.perf_counter()
+
+                    result = {
+                        'episode_idx': episode.episode_idx,
+                        'sample_id': episode.sample_id,
+                        'scene_id': episode.scene_id,
+                        'instruction': episode.instruction,
+                        'target_category': episode.target_category,
+                        'fge': float('inf'),
+                        'cr': 0.0,
+                        'plr': 1.0,
+                        'curv': 0.0,
+                        'has_mask': episode.obstacle_mask is not None,
+                        'inference_ms': float((t1 - t0) * 1000.0),
+                    }
+
+                    # Keep metrics comparable: trim prediction to GT length if needed.
+                    if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
+                        pred_traj = pred_traj[:len(episode.gt_trajectory)]
+
+                    try:
                         metrics = TrajectoryMetrics(
                             pred_traj=pred_traj,
                             gt_traj=episode.gt_trajectory,
                             goal_pos=episode.goal,
-                            obstacle_mask=episode.obstacle_mask
+                            obstacle_mask=episode.obstacle_mask,
                         )
                         result['fge'] = metrics.final_goal_error()
                         result['cr'] = metrics.collision_rate()
@@ -729,28 +936,114 @@ def main():
                         result['gt_traj_len'] = len(episode.gt_trajectory)
                     except Exception as e:
                         result['error'] = str(e)
-                    
+
                     results.append(result)
                     all_pred_trajs.append(pred_traj)
                     if np.isfinite(result.get('inference_ms', float('nan'))):
                         inference_ms_values.append(float(result['inference_ms']))
-                
-                # Visualize
-                if args.visualize_every > 0 and idx % args.visualize_every == 0:
+
+                    if args.visualize_every > 0 and idx % args.visualize_every == 0:
+                        try:
+                            vis_path = seed_output_dir / "visualizations" / f"episode_{idx:05d}.png"
+                            vis_path.parent.mkdir(exist_ok=True)
+                            visualize_episode(episode, pred_traj, result, vis_path)
+                        except Exception as e:
+                            print(f"Visualization failed for episode {idx}: {e}")
+            else:
+                # Process in batches
+                # Process in batches
+                for batch_start in tqdm(range(0, num_episodes, args.batch_size), desc="Batches"):
+                    batch_end = min(batch_start + args.batch_size, num_episodes)
+                    batch_episodes = all_episodes[batch_start:batch_end]
+                    
+                    # Prepare batch inputs
+                    images = [ep.image for ep in batch_episodes]
+                    starts = [ep.start for ep in batch_episodes]
+                    instructions = [ep.instruction for ep in batch_episodes]
+                    
+                    # Batch inference
                     try:
-                        vis_path = seed_output_dir / "visualizations" / f"episode_{idx:05d}.png"
-                        vis_path.parent.mkdir(exist_ok=True)
-                        visualize_episode(episode, pred_traj, result, vis_path)
+                        t0 = time.perf_counter()
+                        pred_trajs = predict_trajectory_batch(
+                            policy, images, starts, instructions, args.device
+                        )
+                        t1 = time.perf_counter()
+                        per_episode_ms = float((t1 - t0) * 1000.0 / max(1, len(batch_episodes)))
+                        batch_inference_ms = [per_episode_ms for _ in range(len(batch_episodes))]
                     except Exception as e:
-                        print(f"Visualization failed for episode {idx}: {e}")
+                        print(f"Batch inference failed: {e}, falling back to single inference")
+                        pred_trajs = []
+                        batch_inference_ms = []
+                        for ep in batch_episodes:
+                            try:
+                                t0 = time.perf_counter()
+                                traj = predict_trajectory(
+                                    policy, ep.image, ep.start, ep.instruction, args.device
+                                )
+                                t1 = time.perf_counter()
+                                pred_trajs.append(traj)
+                                batch_inference_ms.append(float((t1 - t0) * 1000.0))
+                            except:
+                                pred_trajs.append(np.zeros((10, 2)))
+                                batch_inference_ms.append(float('nan'))
+                    
+                    # Compute metrics for each episode in batch
+                    for i, (episode, pred_traj) in enumerate(zip(batch_episodes, pred_trajs)):
+                        idx = batch_start + i
+                        
+                        result = {
+                            'episode_idx': episode.episode_idx,
+                            'sample_id': episode.sample_id,
+                            'scene_id': episode.scene_id,
+                            'instruction': episode.instruction,
+                            'target_category': episode.target_category,
+                            'fge': float('inf'),
+                            'cr': 0.0,
+                            'plr': 1.0,
+                            'curv': 0.0,
+                            'has_mask': episode.obstacle_mask is not None
+                        }
+                        if i < len(batch_inference_ms):
+                            result['inference_ms'] = float(batch_inference_ms[i])
+                        
+                        try:
+                            # Keep metrics comparable: trim prediction to GT length if needed.
+                            if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
+                                pred_traj = pred_traj[:len(episode.gt_trajectory)]
+                            metrics = TrajectoryMetrics(
+                                pred_traj=pred_traj,
+                                gt_traj=episode.gt_trajectory,
+                                goal_pos=episode.goal,
+                                obstacle_mask=episode.obstacle_mask
+                            )
+                            result['fge'] = metrics.final_goal_error()
+                            result['cr'] = metrics.collision_rate()
+                            result['plr'] = metrics.path_length_ratio()
+                            result['curv'] = metrics.curvature()
+                            result['pred_traj_len'] = len(pred_traj)
+                            result['gt_traj_len'] = len(episode.gt_trajectory)
+                        except Exception as e:
+                            result['error'] = str(e)
+                        
+                        results.append(result)
+                        all_pred_trajs.append(pred_traj)
+                        if np.isfinite(result.get('inference_ms', float('nan'))):
+                            inference_ms_values.append(float(result['inference_ms']))
+
+                        # Visualize
+                        if args.visualize_every > 0 and idx % args.visualize_every == 0:
+                            try:
+                                vis_path = seed_output_dir / "visualizations" / f"episode_{idx:05d}.png"
+                                vis_path.parent.mkdir(exist_ok=True)
+                                visualize_episode(episode, pred_traj, result, vis_path)
+                            except Exception as e:
+                                print(f"Visualization failed for episode {idx}: {e}")
         else:
             # Rollout mode: must be sequential (receding horizon)
             for idx in tqdm(range(num_episodes), desc="Rollout"):
-                # Re-set seed before each rollout to ensure consistent randomness
-                if current_seed is not None:
-                    set_seed(current_seed)
                 episode = dataset.get_episode(idx)
-                result, pred_traj = evaluate_episode(policy, episode, args.device, args.use_rollout)
+                noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx)) if current_seed is not None else None
+                result, pred_traj = evaluate_episode(policy, episode, args.device, args.use_rollout, noise_seed=noise_seed)
                 results.append(result)
                 all_pred_trajs.append(pred_traj)
                 if np.isfinite(result.get('inference_ms', float('nan'))):
@@ -790,6 +1083,13 @@ def main():
         if len(valid_inference_ms) > 0:
             print(f"\nPerformance:")
             print(f"  Inference latency:        {np.mean(valid_inference_ms):.2f} ms/episode ± {np.std(valid_inference_ms):.2f} ms")
+            if args.k is not None:
+                valid_first_plan_ms = [float(r['first_plan_ms']) for r in valid_results if np.isfinite(r.get('first_plan_ms', float('nan')))]
+                valid_total_ms = [float(r['total_ms']) for r in valid_results if np.isfinite(r.get('total_ms', float('nan')))]
+                if len(valid_first_plan_ms) > 0:
+                    print(f"  First plan latency:       {np.mean(valid_first_plan_ms):.2f} ms/episode ± {np.std(valid_first_plan_ms):.2f} ms")
+                if len(valid_total_ms) > 0:
+                    print(f"  Full receding latency:    {np.mean(valid_total_ms):.2f} ms/episode ± {np.std(valid_total_ms):.2f} ms")
 
         def scene_group_id(scene_id: str) -> str:
             """Group scene variants like scene700_01/scene700_02 into scene700."""
