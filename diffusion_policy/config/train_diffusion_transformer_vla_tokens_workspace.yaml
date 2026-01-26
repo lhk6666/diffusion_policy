@@ -111,8 +111,8 @@ training:
   debug: False
   resume: True
   lr_scheduler: cosine
-  lr_warmup_steps: 1000
-  num_epochs: 100
+  lr_warmup_steps: 40000
+  num_epochs: 50
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 50
