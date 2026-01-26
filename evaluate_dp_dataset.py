@@ -256,6 +256,101 @@ class DPZarrDataset:
         
         self.num_episodes = len(self.episode_meta)
         print(f"Loaded dataset: {self.num_episodes} episodes, {self.images.shape[0]} images")
+
+
+def _get_attr(attrs: Any, key: str, default: Any = None) -> Any:
+    """Zarr attrs helper that works across Zarr v2/v3."""
+    try:
+        if key in attrs:
+            return attrs[key]
+    except Exception:
+        pass
+    try:
+        return attrs.get(key, default)
+    except Exception:
+        return default
+
+
+def _resolve_action_spec(
+    *,
+    dataset: Optional[DPZarrDataset],
+    action_definition: str,
+    action_delta_anchor: Optional[float],
+    action_eps: Optional[float],
+) -> Tuple[str, Optional[float], Optional[float]]:
+    """Resolve action semantics from CLI + (optional) dataset attrs.
+
+    Supported definitions:
+    - positions: model outputs absolute positions (legacy behavior)
+    - delta_normed_anchor: model outputs normalized deltas; reconstruct via integration
+    - auto: read dataset.zarr root attrs and fall back to positions
+    """
+    resolved = str(action_definition)
+
+    if resolved == 'auto':
+        attrs = dataset.root.attrs if dataset is not None else {}
+        resolved = _get_attr(attrs, 'action_definition', None)
+        if resolved is None:
+            resolved = 'positions'
+        else:
+            resolved = str(resolved)
+
+    if resolved not in {'positions', 'delta_normed_anchor'}:
+        raise ValueError(
+            f"Unsupported action_definition={resolved!r}. "
+            f"Use one of: auto, positions, delta_normed_anchor."
+        )
+
+    if resolved == 'positions':
+        return resolved, None, None
+
+    # delta_normed_anchor
+    if action_delta_anchor is None or action_eps is None:
+        attrs = dataset.root.attrs if dataset is not None else {}
+        if action_delta_anchor is None:
+            v = _get_attr(attrs, 'action_delta_anchor', None)
+            if v is not None:
+                action_delta_anchor = float(v)
+        if action_eps is None:
+            v = _get_attr(attrs, 'action_eps', None)
+            if v is not None:
+                action_eps = float(v)
+
+    if action_delta_anchor is None or action_eps is None:
+        raise ValueError(
+            "action_definition is 'delta_normed_anchor' but anchor/eps are missing. "
+            "Provide --action_delta_anchor and --action_eps or store them in dataset.zarr attrs."
+        )
+
+    return resolved, float(action_delta_anchor), float(action_eps)
+
+
+def _actions_to_trajectory(
+    *,
+    actions: np.ndarray,
+    start_pos: np.ndarray,
+    action_definition: str,
+    action_delta_anchor: Optional[float],
+    action_eps: Optional[float],
+) -> np.ndarray:
+    """Convert model outputs into a (T,2) position trajectory."""
+    actions = np.asarray(actions)
+    if actions.ndim != 2 or actions.shape[-1] != 2:
+        raise ValueError(f"Expected actions shape (T,2), got {actions.shape}")
+
+    if action_definition == 'positions':
+        return actions
+
+    if action_definition != 'delta_normed_anchor':
+        raise ValueError(f"Unsupported action_definition={action_definition!r}")
+
+    scale = float(action_delta_anchor) + float(action_eps)
+    current = np.asarray(start_pos, dtype=np.float32)
+    traj = np.empty_like(actions, dtype=np.float32)
+    for t in range(actions.shape[0]):
+        current = current + actions[t].astype(np.float32) * scale
+        traj[t] = current
+    return traj
     
     def _load_mask(self, sample_id: str, img_idx: int) -> Optional[np.ndarray]:
         """Load obstacle mask.
@@ -351,7 +446,10 @@ def load_dp_model(checkpoint_path: str, device: str = 'cuda:0'):
 def predict_trajectory(policy, image: np.ndarray, start_pos: np.ndarray, 
                        instruction: str = None,
                        device: str = 'cuda:0', horizon: int = 100,
-                       noise_seed: Optional[int] = None) -> np.ndarray:
+                       noise_seed: Optional[int] = None,
+                       action_definition: str = 'positions',
+                       action_delta_anchor: Optional[float] = None,
+                       action_eps: Optional[float] = None) -> np.ndarray:
     """
     Predict trajectory using Diffusion Policy (single sample).
     
@@ -388,11 +486,13 @@ def predict_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
             result = policy.predict_action(obs_dict)
     
     action = result['action'].cpu().numpy()[0]  # (horizon, 2)
-    
-    # Build trajectory from start + actions (actions are positions, not deltas)
-    # In VLA dataset, action = next position
-    trajectory = action  # (horizon, 2)
-    
+    trajectory = _actions_to_trajectory(
+        actions=action,
+        start_pos=start_pos,
+        action_definition=action_definition,
+        action_delta_anchor=action_delta_anchor,
+        action_eps=action_eps,
+    )
     return trajectory
 
 
@@ -405,6 +505,9 @@ def predict_trajectory_receding_with_timing(
     horizon: int = 100,
     k: int = 5,
     noise_seed: Optional[int] = None,
+    action_definition: str = 'positions',
+    action_delta_anchor: Optional[float] = None,
+    action_eps: Optional[float] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """Generate a fixed-length trajectory via receding-horizon replanning.
 
@@ -465,15 +568,28 @@ def predict_trajectory_receding_with_timing(
 
         take = min(chunk_len, remaining)
         if plan.shape[0] < take:
-            # Pad with last predicted point if the plan is shorter than required.
-            pad = np.repeat(plan[-1:,:], take - plan.shape[0], axis=0)
+            if action_definition == 'delta_normed_anchor':
+                pad = np.zeros((take - plan.shape[0], 2), dtype=plan.dtype)
+            else:
+                pad = np.repeat(plan[-1:, :], take - plan.shape[0], axis=0)
             plan = np.concatenate([plan, pad], axis=0)
 
-        append = plan[:take]
-        segments.append(append)
-        num_replans += 1
+        if action_definition == 'positions':
+            append = plan[:take]
+            segments.append(append)
+            current_pos = append[-1].astype(np.float32)
+        else:
+            # Integrate deltas into positions for this segment.
+            scale = float(action_delta_anchor) + float(action_eps)
+            seg = np.empty((take, 2), dtype=np.float32)
+            cur = current_pos.astype(np.float32)
+            for t in range(take):
+                cur = cur + plan[t].astype(np.float32) * scale
+                seg[t] = cur
+            segments.append(seg)
+            current_pos = seg[-1].astype(np.float32)
 
-        current_pos = append[-1].astype(np.float32)
+        num_replans += 1
 
     full = np.concatenate(segments, axis=0) if segments else np.zeros((T, 2), dtype=np.float32)
     if full.shape[0] < T:
@@ -493,7 +609,10 @@ def predict_trajectory_receding_with_timing(
 
 def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: List[np.ndarray],
                              instructions: List[str], device: str = 'cuda:0',
-                             noise_seed: Optional[int] = None) -> List[np.ndarray]:
+                             noise_seed: Optional[int] = None,
+                             action_definition: str = 'positions',
+                             action_delta_anchor: Optional[float] = None,
+                             action_eps: Optional[float] = None) -> List[np.ndarray]:
     """
     Predict trajectories for a batch of samples (much faster than single inference).
     
@@ -535,9 +654,18 @@ def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: 
             result = policy.predict_action(obs_dict)
     
     actions = result['action'].cpu().numpy()  # (B, horizon, 2)
-    
-    # Split into list
-    trajectories = [actions[i] for i in range(B)]
+
+    trajectories: List[np.ndarray] = []
+    for i in range(B):
+        trajectories.append(
+            _actions_to_trajectory(
+                actions=actions[i],
+                start_pos=start_positions[i],
+                action_definition=action_definition,
+                action_delta_anchor=action_delta_anchor,
+                action_eps=action_eps,
+            )
+        )
     return trajectories
 
 
@@ -545,7 +673,10 @@ def rollout_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
                        goal_pos: np.ndarray, device: str = 'cuda:0',
                        instruction: str = None,
                        max_steps: int = 200, goal_threshold: float = 0.05,
-                       noise_seed: Optional[int] = None) -> np.ndarray:
+                       noise_seed: Optional[int] = None,
+                       action_definition: str = 'positions',
+                       action_delta_anchor: Optional[float] = None,
+                       action_eps: Optional[float] = None) -> np.ndarray:
     """
     Rollout trajectory with receding horizon control until reaching goal.
     
@@ -592,7 +723,11 @@ def rollout_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
         
         # Execute n_action_steps
         for i in range(min(n_action_steps, len(actions))):
-            current_pos = actions[i]
+            if action_definition == 'positions':
+                current_pos = actions[i]
+            else:
+                scale = float(action_delta_anchor) + float(action_eps)
+                current_pos = current_pos + actions[i].astype(np.float32) * scale
             trajectory.append(current_pos.copy())
             
             # Check if goal reached
@@ -604,7 +739,10 @@ def rollout_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
 
 def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
                      use_rollout: bool = False,
-                     noise_seed: Optional[int] = None) -> Dict[str, Any]:
+                     noise_seed: Optional[int] = None,
+                     action_definition: str = 'positions',
+                     action_delta_anchor: Optional[float] = None,
+                     action_eps: Optional[float] = None) -> Dict[str, Any]:
     """Evaluate single episode."""
     result = {
         'episode_idx': episode.episode_idx,
@@ -627,6 +765,9 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
                 instruction=episode.instruction,  # Pass instruction!
                 device=device, max_steps=200,
                 noise_seed=noise_seed,
+                action_definition=action_definition,
+                action_delta_anchor=action_delta_anchor,
+                action_eps=action_eps,
             )
         else:
             # Single-shot prediction
@@ -635,6 +776,9 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
                 instruction=episode.instruction,  # Pass instruction!
                 device=device, horizon=len(episode.gt_trajectory),
                 noise_seed=noise_seed,
+                action_definition=action_definition,
+                action_delta_anchor=action_delta_anchor,
+                action_eps=action_eps,
             )
         t1 = time.perf_counter()
         result['inference_ms'] = float((t1 - t0) * 1000.0)
@@ -720,6 +864,25 @@ def main():
                        help='Visualize every N episodes (0 = disabled)')
     parser.add_argument('--batch_size', type=int, default=32,
                        help='Batch size for inference (default: 32)')
+    parser.add_argument(
+        '--action_definition',
+        type=str,
+        default='auto',
+        choices=['auto', 'positions', 'delta_normed_anchor'],
+        help='How to interpret model outputs: auto (read dataset attrs), positions (legacy), or delta_normed_anchor (integrate with anchor).',
+    )
+    parser.add_argument(
+        '--action_delta_anchor',
+        type=float,
+        default=None,
+        help='Anchor for delta_normed_anchor: scale = action_delta_anchor + action_eps. If omitted, read from dataset attrs.',
+    )
+    parser.add_argument(
+        '--action_eps',
+        type=float,
+        default=None,
+        help='Epsilon for delta_normed_anchor: scale = action_delta_anchor + action_eps. If omitted, read from dataset attrs.',
+    )
     parser.add_argument('--num_inference_steps', type=int, default=None,
                        help='Override diffusion denoising steps at inference time (if supported by the policy)')
     parser.add_argument('--seed', type=str, default=None,
@@ -779,6 +942,21 @@ def main():
         # Load dataset
         print(f"\nLoading dataset from {args.dataset}")
         dataset = DPZarrDataset(args.dataset, load_mask=True)
+
+        # Resolve action semantics for this run.
+        action_definition, action_delta_anchor, action_eps = _resolve_action_spec(
+            dataset=dataset,
+            action_definition=args.action_definition,
+            action_delta_anchor=args.action_delta_anchor,
+            action_eps=args.action_eps,
+        )
+        if action_definition == 'delta_normed_anchor':
+            print(
+                f"Action semantics: {action_definition} (scale={float(action_delta_anchor) + float(action_eps):.9g}, "
+                f"anchor={float(action_delta_anchor):.9g}, eps={float(action_eps):.9g})"
+            )
+        else:
+            print(f"Action semantics: {action_definition}")
         
         num_episodes = args.num_episodes or dataset.num_episodes
         num_episodes = min(num_episodes, dataset.num_episodes)
@@ -810,6 +988,9 @@ def main():
                         horizon=len(episode.gt_trajectory),
                         k=int(args.k),
                         noise_seed=noise_seed,
+                        action_definition=action_definition,
+                        action_delta_anchor=action_delta_anchor,
+                        action_eps=action_eps,
                     )
                     result = {
                         'episode_idx': episode.episode_idx,
@@ -900,6 +1081,9 @@ def main():
                         device=args.device,
                         horizon=len(episode.gt_trajectory),
                         noise_seed=noise_seed,
+                        action_definition=action_definition,
+                        action_delta_anchor=action_delta_anchor,
+                        action_eps=action_eps,
                     )
                     t1 = time.perf_counter()
 
@@ -965,7 +1149,14 @@ def main():
                     try:
                         t0 = time.perf_counter()
                         pred_trajs = predict_trajectory_batch(
-                            policy, images, starts, instructions, args.device
+                            policy,
+                            images,
+                            starts,
+                            instructions,
+                            args.device,
+                            action_definition=action_definition,
+                            action_delta_anchor=action_delta_anchor,
+                            action_eps=action_eps,
                         )
                         t1 = time.perf_counter()
                         per_episode_ms = float((t1 - t0) * 1000.0 / max(1, len(batch_episodes)))
@@ -978,7 +1169,16 @@ def main():
                             try:
                                 t0 = time.perf_counter()
                                 traj = predict_trajectory(
-                                    policy, ep.image, ep.start, ep.instruction, args.device
+                                    policy,
+                                    ep.image,
+                                    ep.start,
+                                    instruction=ep.instruction,
+                                    device=args.device,
+                                    horizon=len(ep.gt_trajectory),
+                                    noise_seed=None,
+                                    action_definition=action_definition,
+                                    action_delta_anchor=action_delta_anchor,
+                                    action_eps=action_eps,
                                 )
                                 t1 = time.perf_counter()
                                 pred_trajs.append(traj)
@@ -1043,7 +1243,16 @@ def main():
             for idx in tqdm(range(num_episodes), desc="Rollout"):
                 episode = dataset.get_episode(idx)
                 noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx)) if current_seed is not None else None
-                result, pred_traj = evaluate_episode(policy, episode, args.device, args.use_rollout, noise_seed=noise_seed)
+                result, pred_traj = evaluate_episode(
+                    policy,
+                    episode,
+                    args.device,
+                    args.use_rollout,
+                    noise_seed=noise_seed,
+                    action_definition=action_definition,
+                    action_delta_anchor=action_delta_anchor,
+                    action_eps=action_eps,
+                )
                 results.append(result)
                 all_pred_trajs.append(pred_traj)
                 if np.isfinite(result.get('inference_ms', float('nan'))):
