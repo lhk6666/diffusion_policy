@@ -257,6 +257,52 @@ class DPZarrDataset:
         self.num_episodes = len(self.episode_meta)
         print(f"Loaded dataset: {self.num_episodes} episodes, {self.images.shape[0]} images")
 
+    def _load_mask(self, sample_id: str, img_idx: int) -> Optional[np.ndarray]:
+        """Load obstacle mask.
+
+        Returns: (H, W) binary mask where 1=obstacle, 0=free
+        """
+        if not self.load_mask:
+            return None
+
+        # Use embedded mask from unified format
+        if self.has_embedded_mask:
+            try:
+                mask_small = np.array(self.masks[img_idx])
+                # Convert walkable mask to obstacle mask: 1=obstacle, 0=free
+                obstacle_mask = (~mask_small.astype(bool)).astype(np.uint8)
+                return obstacle_mask
+            except Exception as e:
+                print(f"  Warning: Failed to load embedded mask for {sample_id}: {e}")
+
+        return None
+
+    def get_episode(self, idx: int) -> EpisodeData:
+        meta = self.episode_meta[idx]
+        start_idx = 0 if idx == 0 else self.episode_ends[idx - 1]
+        end_idx = self.episode_ends[idx]
+
+        sample_id = meta['sample_id']
+        img_idx = self.sample_id_to_img_idx[sample_id]
+        image = np.array(self.images[img_idx])
+        gt_traj = np.array(self.agent_pos[start_idx:end_idx])
+
+        obstacle_mask = self._load_mask(sample_id, img_idx)
+
+        return EpisodeData(
+            episode_idx=idx,
+            sample_id=sample_id,
+            scene_id=meta['scene_id'],
+            instruction=meta['instruction'],
+            target_category=meta['target_category'],
+            direction=meta['direction'],
+            goal=np.array(meta['goal']),
+            start=np.array(meta['start']),
+            image=image,
+            gt_trajectory=gt_traj,
+            obstacle_mask=obstacle_mask,
+        )
+
 
 def _get_attr(attrs: Any, key: str, default: Any = None) -> Any:
     """Zarr attrs helper that works across Zarr v2/v3."""
@@ -351,52 +397,6 @@ def _actions_to_trajectory(
         current = current + actions[t].astype(np.float32) * scale
         traj[t] = current
     return traj
-    
-    def _load_mask(self, sample_id: str, img_idx: int) -> Optional[np.ndarray]:
-        """Load obstacle mask.
-        
-        Returns: (H, W) binary mask where 1=obstacle, 0=free
-        """
-        if not self.load_mask:
-            return None
-        
-        # Use embedded mask from unified format
-        if self.has_embedded_mask:
-            try:
-                mask_small = np.array(self.masks[img_idx])
-                # Convert walkable mask to obstacle mask: 1=obstacle, 0=free
-                obstacle_mask = (~mask_small.astype(bool)).astype(np.uint8)
-                return obstacle_mask
-            except Exception as e:
-                print(f"  Warning: Failed to load embedded mask for {sample_id}: {e}")
-        
-        return None
-    
-    def get_episode(self, idx: int) -> EpisodeData:
-        meta = self.episode_meta[idx]
-        start_idx = 0 if idx == 0 else self.episode_ends[idx - 1]
-        end_idx = self.episode_ends[idx]
-        
-        sample_id = meta['sample_id']
-        img_idx = self.sample_id_to_img_idx[sample_id]
-        image = np.array(self.images[img_idx])
-        gt_traj = np.array(self.agent_pos[start_idx:end_idx])
-        
-        obstacle_mask = self._load_mask(sample_id, img_idx)
-        
-        return EpisodeData(
-            episode_idx=idx,
-            sample_id=sample_id,
-            scene_id=meta['scene_id'],
-            instruction=meta['instruction'],
-            target_category=meta['target_category'],
-            direction=meta['direction'],
-            goal=np.array(meta['goal']),
-            start=np.array(meta['start']),
-            image=image,
-            gt_trajectory=gt_traj,
-            obstacle_mask=obstacle_mask
-        )
 
 
 def load_dp_model(checkpoint_path: str, device: str = 'cuda:0'):
@@ -566,7 +566,11 @@ def predict_trajectory_receding_with_timing(
         if plan.ndim != 2 or plan.shape[-1] != 2 or plan.shape[0] < 1:
             raise RuntimeError(f"Unexpected plan shape: {plan.shape}")
 
-        take = min(chunk_len, remaining)
+        # IMPORTANT: do NOT truncate the final executed chunk by `remaining`.
+        # Keeping the full final chunk improves end-point quality; downstream
+        # evaluation resamples trajectories anyway.
+        is_last_replan = remaining <= chunk_len
+        take = plan.shape[0] if is_last_replan else min(chunk_len, remaining)
         if plan.shape[0] < take:
             if action_definition == 'delta_normed_anchor':
                 pad = np.zeros((take - plan.shape[0], 2), dtype=plan.dtype)
@@ -591,12 +595,14 @@ def predict_trajectory_receding_with_timing(
 
         num_replans += 1
 
+        if is_last_replan:
+            break
+
     full = np.concatenate(segments, axis=0) if segments else np.zeros((T, 2), dtype=np.float32)
     if full.shape[0] < T:
         pad_val = full[-1:] if full.shape[0] > 0 else np.zeros((1, 2), dtype=np.float32)
         full = np.concatenate([full, np.repeat(pad_val, T - full.shape[0], axis=0)], axis=0)
-    if full.shape[0] > T:
-        full = full[:T]
+
 
     total_ms = float((time.perf_counter() - t_total0) * 1000.0)
     timing = {
@@ -848,7 +854,7 @@ def main():
     parser.add_argument('--checkpoint', '-c', type=str, required=True,
                        help='Path to DP checkpoint')
     parser.add_argument('--dataset', type=str,
-                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13/val',
+                       default='/media/dragon_llm/linux_ssd/vla_dataset_unified_static_v13_action/val',
                        help='Path to validation Zarr dataset')
     parser.add_argument('--output_dir', '-o', type=str, default='dp_eval_results',
                        help='Output directory')
