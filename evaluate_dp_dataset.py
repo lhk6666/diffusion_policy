@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import random
+import secrets
 import zarr
 import numpy as np
 import torch
@@ -49,6 +50,15 @@ def _episode_noise_seed(base_seed: int, episode_idx: int) -> int:
     # Derive a stable per-episode seed without relying on global RNG state.
     mixed = (int(base_seed) + 1) * 1000003 + int(episode_idx) * 10007
     return int(mixed & 0x7FFFFFFF)
+
+
+def _random_noise_seed() -> int:
+    """Return a fresh random seed for stochastic sampling.
+
+    This is used when the user does not request determinism (seed=None).
+    """
+    # 31-bit non-negative to match other seed helpers.
+    return int(secrets.randbelow(0x7FFFFFFF))
 
 
 def _cuda_device_index(device_str: str) -> Optional[int]:
@@ -505,6 +515,7 @@ def predict_trajectory_receding_with_timing(
     horizon: int = 100,
     k: int = 5,
     noise_seed: Optional[int] = None,
+    randomize_each_replan: bool = False,
     action_definition: str = 'positions',
     action_delta_anchor: Optional[float] = None,
     action_eps: Optional[float] = None,
@@ -552,7 +563,10 @@ def predict_trajectory_receding_with_timing(
             obs_dict['text'] = [instruction]
 
         t0 = time.perf_counter()
-        with _fixed_torch_rng(noise_seed, device):
+        # If the user does not provide a seed (seed=None), we want every replan
+        # to be stochastic and *not* tied to a fixed RNG stream.
+        step_seed = _random_noise_seed() if randomize_each_replan else noise_seed
+        with _fixed_torch_rng(step_seed, device):
             with torch.no_grad():
                 result = policy.predict_action(obs_dict)
         t1 = time.perf_counter()
@@ -984,7 +998,13 @@ def main():
             all_episodes = [dataset.get_episode(idx) for idx in range(num_episodes)]
             for idx, episode in enumerate(tqdm(all_episodes, desc="Episodes (receding)")):
                 try:
-                    noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx)) if current_seed is not None else None
+                    if current_seed is not None:
+                        noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx))
+                        randomize_each_replan = False
+                    else:
+                        # Unseeded run: every replan step should be stochastic.
+                        noise_seed = None
+                        randomize_each_replan = True
                     pred_traj, timing = predict_trajectory_receding_with_timing(
                         policy=policy,
                         image=episode.image,
@@ -994,6 +1014,7 @@ def main():
                         horizon=len(episode.gt_trajectory),
                         k=int(args.k),
                         noise_seed=noise_seed,
+                        randomize_each_replan=randomize_each_replan,
                         action_definition=action_definition,
                         action_delta_anchor=action_delta_anchor,
                         action_eps=action_eps,
@@ -1160,6 +1181,7 @@ def main():
                             starts,
                             instructions,
                             args.device,
+                            noise_seed=_random_noise_seed(),
                             action_definition=action_definition,
                             action_delta_anchor=action_delta_anchor,
                             action_eps=action_eps,
@@ -1181,7 +1203,7 @@ def main():
                                     instruction=ep.instruction,
                                     device=args.device,
                                     horizon=len(ep.gt_trajectory),
-                                    noise_seed=None,
+                                    noise_seed=_random_noise_seed(),
                                     action_definition=action_definition,
                                     action_delta_anchor=action_delta_anchor,
                                     action_eps=action_eps,
@@ -1248,7 +1270,7 @@ def main():
             # Rollout mode: must be sequential (receding horizon)
             for idx in tqdm(range(num_episodes), desc="Rollout"):
                 episode = dataset.get_episode(idx)
-                noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx)) if current_seed is not None else None
+                noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx)) if current_seed is not None else _random_noise_seed()
                 result, pred_traj = evaluate_episode(
                     policy,
                     episode,
