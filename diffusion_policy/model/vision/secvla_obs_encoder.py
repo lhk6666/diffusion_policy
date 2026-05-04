@@ -1,9 +1,8 @@
 """Exact SecVLA encoder adapters for Diffusion Policy.
 
-Unlike the older FlowVLA-specific adapters, these wrappers preserve the full
-SecVLA encoder input contract:
+Mirrors the current single-frame SecVLA pipeline (memory module disabled):
 
-    memories + memory_valid_mask + text token ids + optional depth
+    pixel_values + text token ids + optional depth
 
 This lets the DP baseline change only the decoder while reusing the same
 encoder implementation as SecVLA.
@@ -54,17 +53,14 @@ class _BaseSecVLAObsEncoder(ModuleAttrMixin):
         siglip_model_name: str = "google/siglip2-base-patch16-224",
         d_model: int = 768,
         num_heads: int = 8,
-        num_fusion_layers: int = 6,
+        num_fusion_layers: int = 4,
         unfreeze_last_n_layers: int = 0,
         siglip_deterministic_embeddings: bool = True,
         use_depth: bool = True,
-        use_memory: bool = True,
         depth_use_mask_channel: bool = True,
-        n_vis_pool: int = 32,
-        perceiver_depth: int = 1,
         sector_zmin: float = 0.0,
         sector_zmax: float = 5.0,
-        expected_memory_size: Optional[int] = None,
+        expected_memory_size: Optional[int] = 1,
         encoder_checkpoint_path: Optional[str] = None,
     ):
         super().__init__()
@@ -75,10 +71,8 @@ class _BaseSecVLAObsEncoder(ModuleAttrMixin):
             unfreeze_last_n_layers=unfreeze_last_n_layers,
             siglip_deterministic_embeddings=siglip_deterministic_embeddings,
             use_depth=use_depth,
-            use_memory=use_memory,
+            use_memory=False,
             depth_use_mask_channel=depth_use_mask_channel,
-            n_vis_pool=n_vis_pool,
-            perceiver_depth=perceiver_depth,
             d_model=d_model,
             num_heads=num_heads,
             num_fusion_layers=num_fusion_layers,
@@ -91,27 +85,27 @@ class _BaseSecVLAObsEncoder(ModuleAttrMixin):
             self.load_secvla_encoder_weights(encoder_checkpoint_path)
 
     def _prepare_encoder_inputs(self, obs_dict: Dict[str, torch.Tensor]) -> dict:
-        memories = obs_dict["memories"]
-        if memories.dim() == 6:
-            # Defensive: if a caller passes [B, To, M, C, H, W], flatten To.
-            bsz, to = int(memories.shape[0]), int(memories.shape[1])
-            memories = memories.reshape(bsz * to, *memories.shape[2:])
-        if memories.dim() != 5:
-            raise ValueError(f"memories must be [B,M,3,H,W], got {tuple(memories.shape)}")
+        pixel_values = obs_dict["pixel_values"]
+        if pixel_values.dim() == 5:
+            # Defensive: collapse [B, To, 3, H, W] from n_obs_steps>1 callers.
+            bsz, to = int(pixel_values.shape[0]), int(pixel_values.shape[1])
+            pixel_values = pixel_values.reshape(bsz * to, *pixel_values.shape[2:])
+        if pixel_values.dim() != 4:
+            raise ValueError(
+                f"pixel_values must be [B,3,H,W], got {tuple(pixel_values.shape)}"
+            )
 
         input_ids = _maybe_long(obs_dict.get("input_ids"))
         attention_mask = _maybe_long(obs_dict.get("attention_mask"))
         depth = obs_dict.get("depth", None)
         depth_valid_mask = _maybe_bool(obs_dict.get("depth_valid_mask", None))
-        memory_valid_mask = _maybe_bool(obs_dict.get("memory_valid_mask", None))
 
         return {
-            "memories": memories,
+            "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "depth": depth,
             "depth_valid_mask": depth_valid_mask,
-            "memory_valid_mask": memory_valid_mask,
         }
 
     def load_secvla_encoder_weights(self, checkpoint_path: str) -> None:
@@ -156,13 +150,12 @@ class SecVLAObsEncoder(ModuleAttrMixin):
 
     def forward(self, obs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         enc_inputs = self.impl._prepare_encoder_inputs(obs_dict)
-        context, _ = self.impl.encoder(
-            enc_inputs["memories"],
+        context, *_ = self.impl.encoder(
+            enc_inputs["pixel_values"],
             enc_inputs["input_ids"],
             attention_mask=enc_inputs["attention_mask"],
             depth=enc_inputs["depth"],
             depth_valid_mask=enc_inputs["depth_valid_mask"],
-            memory_valid_mask=enc_inputs["memory_valid_mask"],
         )
         if context.ndim == 2:
             return context
@@ -197,13 +190,12 @@ class SecVLAObsEncoderTokens(ModuleAttrMixin):
 
     def forward(self, obs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         enc_inputs = self.impl._prepare_encoder_inputs(obs_dict)
-        context, _ = self.impl.encoder(
-            enc_inputs["memories"],
+        context, *_ = self.impl.encoder(
+            enc_inputs["pixel_values"],
             enc_inputs["input_ids"],
             attention_mask=enc_inputs["attention_mask"],
             depth=enc_inputs["depth"],
             depth_valid_mask=enc_inputs["depth_valid_mask"],
-            memory_valid_mask=enc_inputs["memory_valid_mask"],
         )
         if context.ndim == 2:
             context = context.unsqueeze(1)

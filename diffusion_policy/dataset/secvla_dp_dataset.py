@@ -1,9 +1,8 @@
 """SecVLA zarr dataset wrapper for Diffusion Policy baselines.
 
-This dataset keeps the observation contract of the exact SecVLA encoder:
+Mirrors the current single-frame SecVLA pipeline (memory module disabled):
 
-    memories            [1, M, 3, H, W]
-    memory_valid_mask   [1, M]
+    pixel_values        [1, 3, H, W]
     input_ids           [1, L]
     attention_mask      [1, L]
     depth               [1, 1, H, W]          (optional)
@@ -76,7 +75,6 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
         use_depth: bool = True,
         require_depth: bool = True,
         depth_zmax: float = 5.0,
-        use_memory: bool = True,
     ):
         super().__init__()
 
@@ -93,7 +91,6 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
         self.use_depth = bool(use_depth)
         self.require_depth = bool(require_depth)
         self.depth_zmax = float(depth_zmax)
-        self.use_memory = bool(use_memory)
 
         self.base = SecVLADataset(
             data_dir=str(self.split_dir),
@@ -102,16 +99,20 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
             max_text_length=max_text_length,
             use_depth=use_depth,
             require_depth=require_depth,
-            depth_zmax=depth_zmax,
-            use_memory=use_memory,
         )
 
         zarr_path = self.split_dir / "dataset.zarr"
         self._store = zarr.open(str(zarr_path), mode="r")
-        self._delta_group = self._store.get("dp_traj_sector_delta", None)
-        if self._delta_group is None:
+        self._episodes_grp = self._store.get("episodes", None)
+        if self._episodes_grp is None:
             raise KeyError(
-                f"{zarr_path} is missing 'dp_traj_sector_delta'. "
+                f"{zarr_path} is missing 'episodes/' group — "
+                "this adapter requires v3.1 episode-major datasets."
+            )
+        first_uid = next(iter(self._episodes_grp.group_keys()), None)
+        if first_uid is None or "dp_traj_sector_delta" not in self._episodes_grp[first_uid]:
+            raise KeyError(
+                f"episodes/{first_uid}/dp_traj_sector_delta not found in {zarr_path}. "
                 "Run SecVLA/scripts/datasets/patch_baseline_labels.py first."
             )
 
@@ -122,43 +123,23 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
 
     def _load_action_delta(self, idx: int) -> torch.Tensor:
         item = self.base.items[idx]
-        sample_id = item["sample_id"]
-        flow_idx = int(item["flow_idx"])
-        if sample_id not in self._delta_group:
-            raise KeyError(f"dp_traj_sector_delta missing sample_id={sample_id}")
-        delta = np.asarray(self._delta_group[sample_id][flow_idx], dtype=np.float32)
+        uid = item["episode_uid"]
+        t_local = int(item["t_local"])
+        k = int(item["k"])
+        delta = np.asarray(
+            self._episodes_grp[uid]["dp_traj_sector_delta"][t_local, k],
+            dtype=np.float32,
+        )
         if delta.ndim != 2 or delta.shape[-1] != 2:
             raise ValueError(
-                f"dp_traj_sector_delta[{sample_id}][{flow_idx}] must be [H,2], got {tuple(delta.shape)}"
+                f"dp_traj_sector_delta[{uid}][{t_local},{k}] must be [H,2], got {tuple(delta.shape)}"
             )
         if int(delta.shape[0]) != self.horizon:
             raise ValueError(
-                f"Expected horizon={self.horizon}, but dp_traj_sector_delta[{sample_id}][{flow_idx}] "
+                f"Expected horizon={self.horizon}, but dp_traj_sector_delta[{uid}][{t_local},{k}] "
                 f"has shape {tuple(delta.shape)}"
             )
         return torch.from_numpy(delta)
-
-    def _pad_memories(self, memories: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        target_len = int(getattr(self.base, "memory_size_target", memories.shape[0]) or memories.shape[0])
-        n_valid = int(memories.shape[0])
-        if n_valid > target_len:
-            raise ValueError(f"Memory length {n_valid} exceeds target_len={target_len}")
-        if n_valid == target_len:
-            valid_mask = torch.ones(target_len, dtype=torch.bool, device=memories.device)
-            return memories, valid_mask
-
-        c, h, w = int(memories.shape[1]), int(memories.shape[2]), int(memories.shape[3])
-        n_null = target_len - n_valid
-        pad = memories.new_zeros((n_null, c, h, w))
-        padded = torch.cat([pad, memories], dim=0)
-        valid_mask = torch.cat(
-            [
-                torch.zeros(n_null, dtype=torch.bool, device=memories.device),
-                torch.ones(n_valid, dtype=torch.bool, device=memories.device),
-            ],
-            dim=0,
-        )
-        return padded, valid_mask
 
     def _select_text(self, item: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         if self.instruction_mode == "sub_instruction":
@@ -174,13 +155,12 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = self.base[idx]
-        memories, memory_valid_mask = self._pad_memories(item["memories"])
+        pixel_values = item["pixel_values"]  # [3, H, W]
         input_ids, attention_mask = self._select_text(item)
         action = self._load_action_delta(idx)
 
         obs: Dict[str, torch.Tensor] = {
-            "memories": memories.unsqueeze(0),
-            "memory_valid_mask": memory_valid_mask.unsqueeze(0),
+            "pixel_values": pixel_values.unsqueeze(0),
             "input_ids": input_ids.unsqueeze(0),
             "attention_mask": attention_mask.unsqueeze(0),
         }
@@ -201,11 +181,23 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
         sumsq = np.zeros((2,), dtype=np.float64)
         count = 0
 
+        # Group items by episode so each episode's [T,K,H,2] array is fetched
+        # exactly once instead of one zarr read per (t_local, k) item.
+        items_by_uid: Dict[str, list] = {}
         for item in self.base.items:
-            sample_id = item["sample_id"]
-            flow_idx = int(item["flow_idx"])
-            delta = np.asarray(self._delta_group[sample_id][flow_idx], dtype=np.float64)
-            flat = delta.reshape(-1, 2)
+            items_by_uid.setdefault(item["episode_uid"], []).append(
+                (int(item["t_local"]), int(item["k"]))
+            )
+
+        for uid, tk_pairs in items_by_uid.items():
+            arr = np.asarray(
+                self._episodes_grp[uid]["dp_traj_sector_delta"][:],
+                dtype=np.float64,
+            )  # [T, K, H, 2]
+            idx_t = np.fromiter((t for t, _ in tk_pairs), dtype=np.int64, count=len(tk_pairs))
+            idx_k = np.fromiter((k for _, k in tk_pairs), dtype=np.int64, count=len(tk_pairs))
+            gathered = arr[idx_t, idx_k]  # [N_items, H, 2] — same slices as the per-item path
+            flat = gathered.reshape(-1, 2)
             mins = np.minimum(mins, flat.min(axis=0))
             maxs = np.maximum(maxs, flat.max(axis=0))
             sums += flat.sum(axis=0)
@@ -249,7 +241,7 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
         )
 
         # Identity normalizers keep the exact SecVLA encoder contract intact.
-        for key in ("memories", "memory_valid_mask", "input_ids", "attention_mask", "depth", "depth_valid_mask"):
+        for key in ("pixel_values", "input_ids", "attention_mask", "depth", "depth_valid_mask"):
             normalizer[key] = _identity_normalizer()
 
         self._action_normalizer = normalizer
@@ -269,7 +261,6 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
             use_depth=self.use_depth,
             require_depth=self.require_depth,
             depth_zmax=self.depth_zmax,
-            use_memory=self.use_memory,
         )
 
 
@@ -302,6 +293,5 @@ class SecVLADeltaTrajectoryDatasetFromPath(SecVLADeltaTrajectoryDataset):
             use_depth=self.use_depth,
             require_depth=self.require_depth,
             depth_zmax=self.depth_zmax,
-            use_memory=self.use_memory,
         )
         return self._val_dataset

@@ -38,17 +38,14 @@ policy:
     siglip_model_name: google/siglip2-base-patch16-224
     d_model: 768
     num_heads: 8
-    num_fusion_layers: 6
+    num_fusion_layers: 4
     unfreeze_last_n_layers: 0
     siglip_deterministic_embeddings: True
     use_depth: true
-    use_memory: true
     depth_use_mask_channel: true
-    n_vis_pool: 32
-    perceiver_depth: 1
     sector_zmin: 0.0
     sector_zmax: 5.0
-    expected_memory_size: null
+    expected_memory_size: 1
     encoder_checkpoint_path: null
     pooling: mean
 
@@ -90,7 +87,7 @@ optimizer:
   lr: 1.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 1.0e-5
+  weight_decay: 1.0e-4
 
 training:
   device: "cuda:0"

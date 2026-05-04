@@ -1,23 +1,14 @@
 name: secvla_dp_delta
 
-memory_size: 8
 text_length: 64
 image_shape: &image_shape [3, 224, 224]
 depth_shape: &depth_shape [1, 224, 224]
 
 shape_meta: &shape_meta
   obs:
-    memories:
-      shape:
-        - ${task.memory_size}
-        - 3
-        - 224
-        - 224
-      type: custom
-    memory_valid_mask:
-      shape:
-        - ${task.memory_size}
-      type: low_dim
+    pixel_values:
+      shape: *image_shape
+      type: rgb
     input_ids:
       shape:
         - ${task.text_length}
@@ -37,8 +28,8 @@ shape_meta: &shape_meta
 
 dataset:
   _target_: diffusion_policy.dataset.secvla_dp_dataset.SecVLADeltaTrajectoryDatasetFromPath
-  train_path: /media/dragon_llm/SSD_DATA/secvla_r2rce_rollouts/train
-  val_path: /media/dragon_llm/SSD_DATA/secvla_r2rce_rollouts/val_unseen
+  train_path: /media/dragon_llm/SSD_DATA/secvla_augmented/train
+  val_path: /media/dragon_llm/SSD_DATA/secvla_augmented/val_unseen
   horizon: ${horizon}
   instruction_mode: sub_instruction
   siglip_model_name: google/siglip2-base-patch16-224
@@ -46,7 +37,6 @@ dataset:
   use_depth: true
   require_depth: true
   depth_zmax: 5.0
-  use_memory: true
 
 env_runner:
   _target_: diffusion_policy.env_runner.base_image_runner.BaseImageRunner
