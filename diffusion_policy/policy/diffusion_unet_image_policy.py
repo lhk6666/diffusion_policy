@@ -13,12 +13,12 @@ from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsE
 from diffusion_policy.common.pytorch_util import dict_apply
 
 class DiffusionUnetImagePolicy(BaseImagePolicy):
-    def __init__(self, 
+    def __init__(self,
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
             obs_encoder: MultiImageObsEncoder,
-            horizon, 
-            n_action_steps, 
+            horizon,
+            n_action_steps,
             n_obs_steps,
             num_inference_steps=None,
             obs_as_global_cond=True,
@@ -27,6 +27,13 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             kernel_size=5,
             n_groups=8,
             cond_predict_scale=True,
+            # Action-head supervision: scalar weight on the 4-way CE loss
+            # over ``action_id`` (STOP/FWD/LEFT/RIGHT). Smaller than SecVLA's
+            # 0.3 because the DDPM ε-pred MSE is in a smaller numeric range.
+            # Zero or negative disables the term, even if the encoder
+            # exposes an action head.
+            action_loss_weight: float = 0.1,
+            action_label_smoothing: float = 0.0,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -78,6 +85,9 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+        self.action_loss_weight     = float(action_loss_weight)
+        self.action_label_smoothing = float(action_label_smoothing)
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -294,4 +304,27 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
+
+        # ── Action-head CE loss (mirrors SecVLA's ``status_head``) ────────
+        # The encoder cached its 4-way logits during the forward above; we
+        # just need the ``action_id`` target from the batch. ``-100``
+        # entries are ignored by cross_entropy. Skip when the head is
+        # disabled OR no action_id was provided OR the weight is ≤ 0.
+        last_logits = getattr(self.obs_encoder, "last_action_logits", None)
+        action_id   = batch.get("action_id", None)
+        if (
+            self.action_loss_weight > 0.0
+            and last_logits is not None
+            and action_id is not None
+        ):
+            target_aid = action_id.long().view(-1)
+            valid = target_aid != -100
+            if int(valid.sum().item()) > 0:
+                action_loss = F.cross_entropy(
+                    last_logits, target_aid,
+                    ignore_index=-100,
+                    label_smoothing=self.action_label_smoothing,
+                )
+                loss = loss + self.action_loss_weight * action_loss
+
         return loss

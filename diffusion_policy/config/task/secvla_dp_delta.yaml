@@ -28,8 +28,16 @@ shape_meta: &shape_meta
 
 dataset:
   _target_: diffusion_policy.dataset.secvla_dp_dataset.SecVLADeltaTrajectoryDatasetFromPath
-  train_path: /media/dragon_llm/SSD_DATA/secvla_augmented/train
-  val_path: /media/dragon_llm/SSD_DATA/secvla_augmented/val_unseen
+  # Mixed R2R + RxR corpus, matching SecVLA's training mixture.
+  # Both ``train_path`` and ``val_path`` accept a single string or a list of
+  # strings. The wrapper concatenates them, enforces a shared ``v_norm``,
+  # and aggregates normalizer stats across all paths.
+  train_path:
+    - /media/dragon_llm/SSD_DATA/secvla_r2r_augmented_v4_balanced/train
+    - /media/dragon_llm/SSD_DATA/secvla_rxr_augmented_v4_balanced/train
+  val_path:
+    - /media/dragon_llm/SSD_DATA/secvla_r2r_augmented_v4_balanced/val_unseen
+    - /media/dragon_llm/SSD_DATA/secvla_rxr_augmented_v4_balanced/val_unseen
   horizon: ${horizon}
   instruction_mode: sub_instruction
   siglip_model_name: google/siglip2-base-patch16-224

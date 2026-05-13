@@ -45,7 +45,17 @@ policy:
     depth_use_mask_channel: true
     sector_zmin: 0.0
     sector_zmax: 5.0
+    # Memory module + 4-way action head — matches SecVLA training.
+    # ``expected_memory_size: 1`` keeps the dataset's single-frame samples
+    # working: the encoder wraps [B,3,H,W] as a 1-slot memory.
+    use_memory: true
+    n_vis_pool: 32
+    perceiver_depth: 1
     expected_memory_size: 1
+    attach_action_head: true
+    num_actions: 4
+    action_head_layers: 2
+    action_head_dropout: 0.1
     encoder_checkpoint_path: null
     pooling: mean
 
@@ -59,6 +69,10 @@ policy:
   kernel_size: 5
   n_groups: 8
   cond_predict_scale: True
+  # CE loss weight on the action head. SecVLA uses 0.3; we ship 0.1 here
+  # since the DDPM ε-prediction MSE is in a smaller numeric range.
+  action_loss_weight: 0.1
+  action_label_smoothing: 0.0
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -83,9 +97,10 @@ val_dataloader:
   persistent_workers: True
 
 optimizer:
+  # Match SecVLA's AdamW exactly (betas come from PyTorch defaults there).
   _target_: torch.optim.AdamW
   lr: 1.0e-4
-  betas: [0.95, 0.999]
+  betas: [0.9, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-4
 
@@ -96,7 +111,7 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 40000
-  num_epochs: 50
+  num_epochs: 1
   gradient_accumulate_every: 1
   use_ema: True
   freeze_encoder: False

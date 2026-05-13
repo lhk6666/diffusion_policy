@@ -35,6 +35,11 @@ class DiffusionTransformerVLAImageTokenPolicy(BaseImagePolicy):
         num_inference_steps: Optional[int] = None,
         obs_as_cond: bool = True,
         pred_action_steps_only: bool = False,
+        # Action-head supervision: scalar weight on the 4-way CE loss over
+        # ``action_id``. See DiffusionUnetImagePolicy for the rationale on
+        # the 0.1 default.
+        action_loss_weight: float = 0.1,
+        action_label_smoothing: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -67,6 +72,9 @@ class DiffusionTransformerVLAImageTokenPolicy(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+        self.action_loss_weight     = float(action_loss_weight)
+        self.action_label_smoothing = float(action_label_smoothing)
 
         if not self.obs_as_cond:
             raise ValueError("DiffusionTransformerVLAImageTokenPolicy requires obs_as_cond=True")
@@ -254,4 +262,38 @@ class DiffusionTransformerVLAImageTokenPolicy(BaseImagePolicy):
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        return loss.mean()
+        loss = loss.mean()
+
+        # ── Action-head CE loss (mirrors SecVLA's ``status_head``) ────────
+        # The encoder cached its 4-way logits during the forward above; we
+        # just need the ``action_id`` target from the batch. ``-100``
+        # entries are ignored by cross_entropy. Skip when the head is
+        # disabled OR no action_id was provided OR the weight is ≤ 0.
+        last_logits = getattr(self.obs_encoder, "last_action_logits", None)
+        action_id   = batch.get("action_id", None)
+        if (
+            self.action_loss_weight > 0.0
+            and last_logits is not None
+            and action_id is not None
+        ):
+            # Encoder ran on B*To frames; with n_obs_steps=1 (the only
+            # value the SecVLA DP dataset currently supplies action_id for)
+            # the rows line up 1:1 with action_id. For To>1 we'd need
+            # per-step ids; assert to surface that case loudly.
+            if last_logits.shape[0] != action_id.shape[0]:
+                raise RuntimeError(
+                    f"action-head logits batch ({last_logits.shape[0]}) does not "
+                    f"match action_id batch ({action_id.shape[0]}). Likely caused "
+                    f"by n_obs_steps>1 without per-step action_id supervision."
+                )
+            target_aid = action_id.long().view(-1)
+            valid = target_aid != -100
+            if int(valid.sum().item()) > 0:
+                action_loss = F.cross_entropy(
+                    last_logits, target_aid,
+                    ignore_index=-100,
+                    label_smoothing=self.action_label_smoothing,
+                )
+                loss = loss + self.action_loss_weight * action_loss
+
+        return loss

@@ -29,7 +29,8 @@ policy:
     siglip_model_name: google/siglip2-base-patch16-224
     d_model: 768
     num_heads: 8
-    num_fusion_layers: 6
+    # Was 6 (mismatch); SecVLA default is 4.
+    num_fusion_layers: 4
     unfreeze_last_n_layers: 0
     siglip_deterministic_embeddings: True
     use_depth: true
@@ -39,7 +40,14 @@ policy:
     perceiver_depth: 1
     sector_zmin: 0.0
     sector_zmax: 5.0
-    expected_memory_size: null
+    # Keep the encoder wrapping single-frame [B,3,H,W] as a 1-slot memory
+    # so the runtime contract matches the unet variant.
+    expected_memory_size: 1
+    # 4-way action head (matches SecVLA's status_head).
+    attach_action_head: true
+    num_actions: 4
+    action_head_layers: 2
+    action_head_dropout: 0.1
     encoder_checkpoint_path: null
 
   model:
@@ -77,6 +85,11 @@ policy:
   num_inference_steps: 100
   obs_as_cond: ${obs_as_cond}
   pred_action_steps_only: ${pred_action_steps_only}
+  # CE loss weight on the 4-way action head (STOP / FWD / LEFT / RIGHT).
+  # SecVLA uses 0.3; we use 0.1 here since DDPM ε-pred MSE is in a smaller
+  # numeric range.
+  action_loss_weight: 0.1
+  action_label_smoothing: 0.0
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -101,10 +114,13 @@ val_dataloader:
   persistent_workers: True
 
 optimizer:
-  transformer_weight_decay: 1.0e-5
-  obs_encoder_weight_decay: 1.0e-5
+  # Align with SecVLA: AdamW lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.999).
+  # Workspace splits weight_decay between transformer and encoder; we set
+  # both to 1e-4 to match SecVLA's single-group AdamW.
+  transformer_weight_decay: 1.0e-4
+  obs_encoder_weight_decay: 1.0e-4
   learning_rate: 1.0e-4
-  betas: [0.9, 0.95]
+  betas: [0.9, 0.999]
 
 training:
   device: "cuda:0"
@@ -113,7 +129,7 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 40000
-  num_epochs: 50
+  num_epochs: 1
   gradient_accumulate_every: 1
   use_ema: True
   freeze_encoder: False
