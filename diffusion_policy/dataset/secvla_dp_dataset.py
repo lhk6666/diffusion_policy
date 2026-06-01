@@ -97,6 +97,10 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
         use_depth: bool = True,
         require_depth: bool = True,
         depth_zmax: float = 5.0,
+        # Waypoint baseline: collapse the full H-step delta trajectory into a
+        # single endpoint (cumulative sum = goal displacement). Returns a
+        # length-1 action so the DP transformer trains with horizon=1.
+        waypoint_target: bool = False,
     ):
         super().__init__()
 
@@ -113,6 +117,7 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
         self.use_depth = bool(use_depth)
         self.require_depth = bool(require_depth)
         self.depth_zmax = float(depth_zmax)
+        self.waypoint_target = bool(waypoint_target)
 
         self.base = SecVLADataset(
             data_dir=str(self.split_dir),
@@ -177,7 +182,11 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
             raise ValueError(
                 f"dp_traj_cart_delta[{uid}][{t_local},{k}] must be [H,2], got {tuple(delta.shape)}"
             )
-        if int(delta.shape[0]) != self.horizon:
+        if self.waypoint_target:
+            # Endpoint = cumulative sum of all per-step deltas (goal
+            # displacement from the current pose). Shape [1, 2] → horizon=1.
+            delta = delta.sum(axis=0, keepdims=True)
+        elif int(delta.shape[0]) != self.horizon:
             raise ValueError(
                 f"Expected horizon={self.horizon}, but dp_traj_cart_delta[{uid}][{t_local},{k}] "
                 f"has shape {tuple(delta.shape)}"
@@ -255,7 +264,10 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
             idx_t = np.fromiter((t for t, _ in tk_pairs), dtype=np.int64, count=len(tk_pairs))
             idx_k = np.fromiter((k for _, k in tk_pairs), dtype=np.int64, count=len(tk_pairs))
             gathered = arr[idx_t, idx_k]  # [N_items, H, 2] — same slices as the per-item path
-            flat = gathered.reshape(-1, 2)
+            if self.waypoint_target:
+                flat = gathered.sum(axis=1)  # [N_items, 2] cumulative endpoints
+            else:
+                flat = gathered.reshape(-1, 2)
             mins = np.minimum(mins, flat.min(axis=0))
             maxs = np.maximum(maxs, flat.max(axis=0))
             sums += flat.sum(axis=0)
@@ -324,6 +336,7 @@ class SecVLADeltaTrajectoryDataset(BaseImageDataset):
             use_depth=self.use_depth,
             require_depth=self.require_depth,
             depth_zmax=self.depth_zmax,
+            waypoint_target=self.waypoint_target,
         )
 
 
@@ -390,6 +403,7 @@ class SecVLADeltaTrajectoryDatasetFromPath(BaseImageDataset):
         self.use_depth: bool = first.use_depth
         self.require_depth: bool = first.require_depth
         self.depth_zmax: float = first.depth_zmax
+        self.waypoint_target: bool = first.waypoint_target
 
         self._action_normalizer: Optional[LinearNormalizer] = None
         self._val_dataset: Optional["SecVLADeltaTrajectoryDatasetFromPath"] = None
@@ -432,7 +446,10 @@ class SecVLADeltaTrajectoryDatasetFromPath(BaseImageDataset):
                 idx_t = np.fromiter((t for t, _ in tk_pairs), dtype=np.int64, count=len(tk_pairs))
                 idx_k = np.fromiter((k for _, k in tk_pairs), dtype=np.int64, count=len(tk_pairs))
                 gathered = arr[idx_t, idx_k]
-                flat = gathered.reshape(-1, 2)
+                if self.waypoint_target:
+                    flat = gathered.sum(axis=1)  # [N_items, 2] cumulative endpoints
+                else:
+                    flat = gathered.reshape(-1, 2)
                 mins = np.minimum(mins, flat.min(axis=0))
                 maxs = np.maximum(maxs, flat.max(axis=0))
                 sums += flat.sum(axis=0)

@@ -1,0 +1,51 @@
+name: secvla_dp_waypoint
+
+text_length: 64
+image_shape: &image_shape [3, 224, 224]
+depth_shape: &depth_shape [1, 224, 224]
+
+shape_meta: &shape_meta
+  obs:
+    pixel_values:
+      shape: *image_shape
+      type: rgb
+    input_ids:
+      shape:
+        - ${task.text_length}
+      type: low_dim
+    attention_mask:
+      shape:
+        - ${task.text_length}
+      type: low_dim
+    depth:
+      shape: *depth_shape
+      type: low_dim
+    depth_valid_mask:
+      shape: *depth_shape
+      type: low_dim
+  action:
+    shape: [2]
+
+dataset:
+  _target_: diffusion_policy.dataset.secvla_dp_dataset.SecVLADeltaTrajectoryDatasetFromPath
+  # Same mixed R2R + RxR corpus as secvla_dp_delta.
+  train_path:
+    - /media/dragon_llm/SSD_DATA/secvla_r2r_augmented_v4_balanced_224/train
+    - /media/dragon_llm/SSD_DATA/secvla_rxr_augmented_v4_balanced_224/train
+  val_path:
+    - /media/dragon_llm/SSD_DATA/secvla_r2r_augmented_v4_balanced_224/val_unseen
+    - /media/dragon_llm/SSD_DATA/secvla_rxr_augmented_v4_balanced_224/val_unseen
+  horizon: ${horizon}
+  instruction_mode: sub_instruction
+  siglip_model_name: google/siglip2-base-patch16-224
+  max_text_length: ${task.text_length}
+  use_depth: true
+  require_depth: true
+  depth_zmax: 5.0
+  # Waypoint baseline: collapse the H-step delta trajectory into a single
+  # endpoint (cumulative sum = goal displacement). The dataset then returns a
+  # length-1 action [1, 2], so the DP transformer trains with horizon=1.
+  waypoint_target: true
+
+env_runner:
+  _target_: diffusion_policy.env_runner.base_image_runner.BaseImageRunner
