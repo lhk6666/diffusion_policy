@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.utils.torch_utils import randn_tensor
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
@@ -113,8 +114,10 @@ class DiffusionTransformerVLAImageTokenPolicy(BaseImagePolicy):
         model = self.model
         scheduler = self.noise_scheduler
 
-        trajectory = torch.randn(
-            size=condition_data.shape,
+        # Accept one explicit RNG stream per batch element for reproducible
+        # batched evaluation.  Single-generator behavior is unchanged.
+        trajectory = randn_tensor(
+            shape=condition_data.shape,
             dtype=condition_data.dtype,
             device=condition_data.device,
             generator=generator,

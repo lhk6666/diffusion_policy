@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.utils.torch_utils import randn_tensor
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
@@ -100,11 +101,16 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         model = self.model
         scheduler = self.noise_scheduler
 
-        trajectory = torch.randn(
-            size=condition_data.shape, 
+        # ``randn_tensor`` is identical to ``torch.randn`` for a single
+        # generator, and also accepts one generator per batch item.  The
+        # latter preserves deterministic per-episode streams during batched
+        # evaluation-only trajectory export.
+        trajectory = randn_tensor(
+            shape=condition_data.shape,
             dtype=condition_data.dtype,
             device=condition_data.device,
-            generator=generator)
+            generator=generator,
+        )
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)

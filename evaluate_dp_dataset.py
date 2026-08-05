@@ -28,11 +28,12 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Mapping
 import re
 import time
 import math
 import contextlib
+import tempfile
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -59,6 +60,55 @@ def _random_noise_seed() -> int:
     """
     # 31-bit non-negative to match other seed helpers.
     return int(secrets.randbelow(0x7FFFFFFF))
+
+
+def _make_torch_generator(seed: int, device: str) -> torch.Generator:
+    """Create an explicit generator on the policy's inference device."""
+    generator_device = (
+        device
+        if isinstance(device, str) and device.startswith('cuda')
+        else 'cpu'
+    )
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(int(seed))
+    return generator
+
+
+@contextlib.contextmanager
+def _policy_generator_streams(
+    policy,
+    noise_seeds: Optional[List[int]],
+    device: str,
+):
+    """Temporarily install one deterministic RNG stream per batch item.
+
+    The two evaluated diffusion policies forward ``policy.kwargs`` to both
+    their initial Gaussian draw and ``DDPMScheduler.step``.  A generator list
+    therefore keeps each episode's stochastic stream independent while the
+    expensive encoder and denoiser calls are batched.  The dictionary is
+    restored exactly so legacy and training behavior remain unchanged.
+    """
+    if noise_seeds is None:
+        yield
+        return
+    if not hasattr(policy, 'kwargs') or not isinstance(policy.kwargs, dict):
+        raise TypeError(
+            "Seeded batch inference requires policy.kwargs to be a dictionary"
+        )
+    generators = [
+        _make_torch_generator(int(seed), device)
+        for seed in noise_seeds
+    ]
+    sentinel = object()
+    previous = policy.kwargs.get('generator', sentinel)
+    policy.kwargs['generator'] = generators
+    try:
+        yield
+    finally:
+        if previous is sentinel:
+            policy.kwargs.pop('generator', None)
+        else:
+            policy.kwargs['generator'] = previous
 
 
 def _cuda_device_index(device_str: str) -> Optional[int]:
@@ -100,9 +150,143 @@ sys.path.insert(0, str(script_dir))
 # Also add FlowVLA root to path so we can share evaluation metrics.
 FLOWVLA_ROOT = script_dir.parents[2]
 sys.path.insert(0, str(FLOWVLA_ROOT))
+sys.path.insert(0, str(script_dir.parents[1]))
 
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.common.pytorch_util import dict_apply
+from src.evaluation_cache import materialize_evaluation_array
+
+
+def _load_adjusted_start_manifest(path: Optional[Path]):
+    """Load the shared, evaluation-only adjusted-start cohort lazily."""
+    if path is None:
+        return None
+    from scripts.test.adjusted_start_manifest import load_adjusted_start_manifest
+
+    return load_adjusted_start_manifest(
+        Path(path).expanduser().resolve(),
+        require_suffix_contract=True,
+    )
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _adjusted_start_provenance(path: Optional[Path], manifest) -> Optional[Dict[str, Any]]:
+    if manifest is None:
+        return None
+    if path is None:
+        raise ValueError("Adjusted-start manifest object requires a source path")
+    return {
+        "path": str(Path(path).expanduser().resolve()),
+        "sha256": str(manifest.sha256),
+        "summary": _json_safe(manifest.summary),
+    }
+
+
+def _evaluation_indices(manifest, total_episodes: int) -> List[int]:
+    """Return validated original dataset indices, never compact row numbers."""
+    if manifest is None:
+        return list(range(int(total_episodes)))
+    raw = np.asarray(manifest.eligible_indices)
+    if raw.ndim != 1:
+        raise ValueError(
+            f"manifest.eligible_indices must be one-dimensional, got {raw.shape}"
+        )
+    try:
+        numeric = raw.astype(np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("manifest.eligible_indices must be integral") from error
+    if (
+        np.any(~np.isfinite(numeric))
+        or np.any(numeric != np.rint(numeric))
+    ):
+        raise ValueError("manifest.eligible_indices must contain finite integers")
+    indices = numeric.astype(np.int64)
+    if np.unique(indices).shape[0] != indices.shape[0]:
+        raise ValueError("manifest.eligible_indices contains duplicates")
+    if np.any(indices < 0) or np.any(indices >= int(total_episodes)):
+        raise IndexError(
+            "manifest.eligible_indices contains an index outside the dataset: "
+            f"dataset length={total_episodes}"
+        )
+    return [int(value) for value in indices.tolist()]
+
+
+def _apply_adjusted_start(
+    manifest,
+    *,
+    dataset_index: int,
+    sample_id: str,
+    scene_id: str,
+    gt_trajectory: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Apply and defensively validate one manifest-selected GT suffix."""
+    gt = np.asarray(gt_trajectory, dtype=np.float32)
+    if manifest is None:
+        if gt.ndim != 2 or gt.shape[1] != 2 or gt.shape[0] == 0:
+            raise ValueError(
+                f"dataset_index={dataset_index} has invalid GT shape {gt.shape}"
+            )
+        return gt[0].copy(), gt, 0
+
+    selection = manifest.apply_to_gt(
+        int(dataset_index), str(sample_id), str(scene_id), gt
+    )
+    adjusted_start = np.asarray(
+        selection.adjusted_start_xy_norm, dtype=np.float32
+    )
+    gt_suffix = np.asarray(selection.gt_suffix, dtype=np.float32)
+    gt_start_index = int(selection.gt_start_index)
+    if adjusted_start.shape != (2,) or not np.all(np.isfinite(adjusted_start)):
+        raise ValueError(
+            f"dataset_index={dataset_index} manifest start must be finite (2,), "
+            f"got {adjusted_start!r}"
+        )
+    if (
+        gt_suffix.ndim != 2
+        or gt_suffix.shape[1] != 2
+        or gt_suffix.shape[0] == 0
+        or not np.all(np.isfinite(gt_suffix))
+    ):
+        raise ValueError(
+            f"dataset_index={dataset_index} manifest GT suffix is invalid: "
+            f"shape={gt_suffix.shape}"
+        )
+    if gt_start_index < 0 or gt_start_index >= gt.shape[0]:
+        raise ValueError(
+            f"dataset_index={dataset_index} manifest gt_start_index="
+            f"{gt_start_index} is outside GT length {gt.shape[0]}"
+        )
+    expected_suffix_lengths = {
+        gt.shape[0] - gt_start_index,
+        gt.shape[0] - gt_start_index + 1,
+    }
+    if gt_suffix.shape[0] not in expected_suffix_lengths:
+        raise ValueError(
+            f"dataset_index={dataset_index} manifest GT suffix length "
+            f"{gt_suffix.shape[0]} disagrees with start index {gt_start_index} "
+            f"and original length {gt.shape[0]}"
+        )
+    if not np.allclose(
+        adjusted_start, gt_suffix[0], rtol=0.0, atol=1e-6
+    ):
+        raise ValueError(
+            f"dataset_index={dataset_index} adjusted start is not the first "
+            "point of the continuous GT suffix"
+        )
+    return adjusted_start, gt_suffix, gt_start_index
 
 
 # Shared metrics implementation (preferred). Fallback keeps this script runnable standalone.
@@ -208,7 +392,322 @@ class EpisodeData:
     start: np.ndarray          # (2,) normalized [0,1]
     image: np.ndarray          # (H, W, 3) uint8
     gt_trajectory: np.ndarray  # (T, 2) normalized [0,1]
+    original_start: np.ndarray # (2,) canonical dataset start before adjustment
+    original_horizon: int      # native horizon before removing the GT prefix
+    gt_start_index: int        # selected index in the original GT trajectory
     obstacle_mask: Optional[np.ndarray] = None  # (H, W) binary, 1=obstacle
+
+
+TRAJECTORY_ARCHIVE_FILENAME = "trajectory_archive.npz"
+TRAJECTORY_ARCHIVE_SCHEMA_VERSION = 1
+TRAJECTORY_ARCHIVE_INCLUDES_START = True
+TRAJECTORY_COORDINATE_CONVENTION = "normalized_image_xy_x_right_y_down"
+
+
+def build_evaluation_config(
+    *,
+    checkpoint: str,
+    dataset: str,
+    num_episodes: int,
+    use_rollout: bool,
+    seed: Optional[int],
+    device: str,
+    batch_size: int,
+    num_inference_steps_requested: Optional[int],
+    num_inference_steps_actual: Optional[int],
+    k: Optional[int],
+    visualize_every: int,
+    action_definition_requested: str,
+    action_definition_resolved: str,
+    action_delta_anchor_resolved: Optional[float],
+    action_eps_resolved: Optional[float],
+    seeded_batch: bool = False,
+    adjusted_start_manifest_provenance: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build JSON-safe provenance metadata without affecting evaluation."""
+    action_scale_resolved = None
+    if (
+        action_delta_anchor_resolved is not None
+        and action_eps_resolved is not None
+    ):
+        action_scale_resolved = float(
+            action_delta_anchor_resolved + action_eps_resolved
+        )
+
+    return {
+        "checkpoint": str(checkpoint),
+        "dataset": str(dataset),
+        "num_episodes": int(num_episodes),
+        "use_rollout": bool(use_rollout),
+        "seed": None if seed is None else int(seed),
+        "device": str(device),
+        "batch_size": int(batch_size),
+        "seeded_batch": bool(seeded_batch),
+        "num_inference_steps_requested": (
+            None
+            if num_inference_steps_requested is None
+            else int(num_inference_steps_requested)
+        ),
+        "num_inference_steps_actual": (
+            None
+            if num_inference_steps_actual is None
+            else int(num_inference_steps_actual)
+        ),
+        "k": None if k is None else int(k),
+        "visualize_every": int(visualize_every),
+        "action_definition_requested": str(action_definition_requested),
+        "action_definition_resolved": str(action_definition_resolved),
+        "action_delta_anchor_resolved": (
+            None
+            if action_delta_anchor_resolved is None
+            else float(action_delta_anchor_resolved)
+        ),
+        "action_eps_resolved": (
+            None if action_eps_resolved is None else float(action_eps_resolved)
+        ),
+        "action_scale_resolved": action_scale_resolved,
+        "trajectory_archive": {
+            "filename": TRAJECTORY_ARCHIVE_FILENAME,
+            "schema_version": TRAJECTORY_ARCHIVE_SCHEMA_VERSION,
+            "includes_start": TRAJECTORY_ARCHIVE_INCLUDES_START,
+            "coordinate_convention": TRAJECTORY_COORDINATE_CONVENTION,
+        },
+        "adjusted_start_manifest": (
+            None
+            if adjusted_start_manifest_provenance is None
+            else dict(adjusted_start_manifest_provenance)
+        ),
+    }
+
+
+def build_trajectory_archive_payload(
+    results: List[Dict[str, Any]],
+    pred_trajectories: List[Optional[np.ndarray]],
+    episode_meta: List[Dict[str, Any]],
+    episode_start_by_index: Optional[Mapping[int, np.ndarray]] = None,
+    gt_start_index_by_index: Optional[Mapping[int, int]] = None,
+    original_horizon_by_index: Optional[Mapping[int, int]] = None,
+    adjusted_start_manifest_provenance: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, np.ndarray]:
+    """Build a stable, pickle-free archive of complete predicted paths.
+
+    The evaluator's legacy metrics intentionally continue to consume the raw
+    model output.  Only this archive prepends the episode start so downstream
+    swept-footprint evaluation also covers the segment from the known start to
+    the first predicted action/position.
+
+    Trajectories may have different lengths (for example in rollout mode), so
+    rows are padded with NaNs and ``trajectory_length`` stores the valid prefix
+    length, including the prepended start point.
+    """
+    if len(results) != len(pred_trajectories):
+        raise ValueError(
+            "results/pred_trajectories length mismatch: "
+            f"{len(results)} != {len(pred_trajectories)}"
+        )
+    if not results:
+        raise ValueError("Cannot build an empty trajectory archive")
+
+    dataset_indices: List[int] = []
+    sample_ids: List[str] = []
+    scene_ids: List[str] = []
+    success_values: List[bool] = []
+    error_messages: List[str] = []
+    starts: List[np.ndarray] = []
+    original_starts: List[np.ndarray] = []
+    gt_start_indices: List[int] = []
+    original_horizons: List[int] = []
+    complete_trajectories: List[np.ndarray] = []
+
+    for row, pred_trajectory in zip(results, pred_trajectories):
+        dataset_index = int(row["episode_idx"])
+        if dataset_index < 0 or dataset_index >= len(episode_meta):
+            raise IndexError(
+                f"episode_idx={dataset_index} is outside episode_meta "
+                f"with length {len(episode_meta)}"
+            )
+        meta = episode_meta[dataset_index]
+
+        sample_id = str(row["sample_id"])
+        scene_id = str(row["scene_id"])
+        expected_sample_id = str(meta["sample_id"])
+        expected_scene_id = str(meta["scene_id"])
+        if sample_id != expected_sample_id:
+            raise ValueError(
+                f"sample_id mismatch at dataset_index={dataset_index}: "
+                f"result={sample_id!r}, metadata={expected_sample_id!r}"
+            )
+        if scene_id != expected_scene_id:
+            raise ValueError(
+                f"scene_id mismatch at dataset_index={dataset_index}: "
+                f"result={scene_id!r}, metadata={expected_scene_id!r}"
+            )
+
+        original_start = np.asarray(meta["start"], dtype=np.float32)
+        if original_start.shape != (2,) or not np.all(np.isfinite(original_start)):
+            raise ValueError(
+                f"Invalid start at dataset_index={dataset_index}: "
+                f"shape={original_start.shape}, value={original_start!r}"
+            )
+        if episode_start_by_index is None:
+            start = original_start
+        else:
+            if dataset_index not in episode_start_by_index:
+                raise KeyError(
+                    "episode_start_by_index is missing dataset_index="
+                    f"{dataset_index}"
+                )
+            start = np.asarray(
+                episode_start_by_index[dataset_index], dtype=np.float32
+            )
+            if start.shape != (2,) or not np.all(np.isfinite(start)):
+                raise ValueError(
+                    f"Invalid evaluated start at dataset_index={dataset_index}: "
+                    f"shape={start.shape}, value={start!r}"
+                )
+        gt_start_index = (
+            0
+            if gt_start_index_by_index is None
+            else int(gt_start_index_by_index[dataset_index])
+        )
+        original_horizon = (
+            int(meta.get("traj_len", 1))
+            if original_horizon_by_index is None
+            else int(original_horizon_by_index[dataset_index])
+        )
+        if gt_start_index < 0:
+            raise ValueError(
+                f"gt_start_index must be non-negative at dataset_index={dataset_index}"
+            )
+        if original_horizon <= 0 or gt_start_index >= original_horizon:
+            raise ValueError(
+                f"Invalid original horizon/start index at dataset_index={dataset_index}: "
+                f"horizon={original_horizon}, gt_start_index={gt_start_index}"
+            )
+
+        if pred_trajectory is None:
+            pred = np.empty((0, 2), dtype=np.float32)
+        else:
+            pred = np.asarray(pred_trajectory, dtype=np.float32)
+            if pred.ndim != 2 or pred.shape[1] != 2:
+                raise ValueError(
+                    f"Invalid predicted trajectory at dataset_index={dataset_index}: "
+                    f"expected (T,2), got {pred.shape}"
+                )
+
+        complete = np.concatenate((start[None, :], pred), axis=0)
+        dataset_indices.append(dataset_index)
+        sample_ids.append(sample_id)
+        scene_ids.append(scene_id)
+        error_message = str(row.get("error", "") or "")
+        success_values.append(pred_trajectory is not None and not error_message)
+        error_messages.append(error_message)
+        starts.append(start)
+        original_starts.append(original_start)
+        gt_start_indices.append(gt_start_index)
+        original_horizons.append(original_horizon)
+        complete_trajectories.append(complete)
+
+    dataset_index_array = np.asarray(dataset_indices, dtype=np.int64)
+    if np.unique(dataset_index_array).shape[0] != dataset_index_array.shape[0]:
+        raise ValueError("dataset_index values must be unique in a trajectory archive")
+
+    trajectory_lengths = np.asarray(
+        [trajectory.shape[0] for trajectory in complete_trajectories],
+        dtype=np.int64,
+    )
+    max_length = int(trajectory_lengths.max())
+    padded = np.full(
+        (len(complete_trajectories), max_length, 2),
+        np.nan,
+        dtype=np.float32,
+    )
+    for row_index, trajectory in enumerate(complete_trajectories):
+        padded[row_index, : trajectory.shape[0]] = trajectory
+
+    archive = {
+        "archive_schema_version": np.asarray(
+            TRAJECTORY_ARCHIVE_SCHEMA_VERSION, dtype=np.int64
+        ),
+        "trajectory_includes_start": np.asarray(
+            TRAJECTORY_ARCHIVE_INCLUDES_START, dtype=np.bool_
+        ),
+        "coordinate_convention": np.asarray(TRAJECTORY_COORDINATE_CONVENTION),
+        "dataset_index": dataset_index_array,
+        "sample_id": np.asarray(sample_ids, dtype=str),
+        "scene_id": np.asarray(scene_ids, dtype=str),
+        "success": np.asarray(success_values, dtype=np.bool_),
+        "error": np.asarray(error_messages, dtype=str),
+        "start_xy_norm": np.stack(starts, axis=0).astype(np.float32, copy=False),
+        "original_start_xy_norm": np.stack(original_starts, axis=0).astype(
+            np.float32, copy=False
+        ),
+        "gt_start_index": np.asarray(gt_start_indices, dtype=np.int64),
+        "original_horizon": np.asarray(original_horizons, dtype=np.int64),
+        "trajectory_xy_norm": padded,
+        "trajectory_length": trajectory_lengths,
+    }
+    if adjusted_start_manifest_provenance is not None:
+        provenance = dict(adjusted_start_manifest_provenance)
+        summary = dict(provenance.get("summary", {}))
+        archive.update(
+            {
+                "adjusted_start_manifest_sha256": np.asarray(
+                    str(provenance["sha256"])
+                ),
+                "adjusted_start_manifest_path": np.asarray(
+                    str(provenance["path"])
+                ),
+                "adjusted_start_footprint_radius_m": np.asarray(
+                    float(summary["footprint_radius_m"]), dtype=np.float64
+                ),
+            }
+        )
+    return archive
+
+
+def save_trajectory_archive(
+    path: Path,
+    results: List[Dict[str, Any]],
+    pred_trajectories: List[Optional[np.ndarray]],
+    episode_meta: List[Dict[str, Any]],
+    episode_start_by_index: Optional[Mapping[int, np.ndarray]] = None,
+    gt_start_index_by_index: Optional[Mapping[int, int]] = None,
+    original_horizon_by_index: Optional[Mapping[int, int]] = None,
+    adjusted_start_manifest_provenance: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Atomically save a per-seed trajectory archive."""
+    archive_path = Path(path)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = build_trajectory_archive_payload(
+        results=results,
+        pred_trajectories=pred_trajectories,
+        episode_meta=episode_meta,
+        episode_start_by_index=episode_start_by_index,
+        gt_start_index_by_index=gt_start_index_by_index,
+        original_horizon_by_index=original_horizon_by_index,
+        adjusted_start_manifest_provenance=(
+            adjusted_start_manifest_provenance
+        ),
+    )
+
+    temporary_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            prefix=f".{archive_path.name}.",
+            suffix=".tmp",
+            dir=archive_path.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            np.savez_compressed(temporary_file, **payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, archive_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 class DPZarrDataset:
@@ -219,9 +718,15 @@ class DPZarrDataset:
     2. Unified format (generate_vla_v2): zarr_path contains dataset.zarr subdir with embedded mask
     """
     
-    def __init__(self, zarr_path: str, load_mask: bool = True):
+    def __init__(
+        self,
+        zarr_path: str,
+        load_mask: bool = True,
+        adjusted_start_manifest=None,
+    ):
         self.zarr_path = Path(zarr_path)
         self.load_mask = load_mask
+        self.adjusted_start_manifest = adjusted_start_manifest
         
         # Handle both direct path and parent directory (unified format)
         if (self.zarr_path / 'dataset.zarr').exists():
@@ -238,8 +743,17 @@ class DPZarrDataset:
         with open(episode_meta_path, "r") as f:
             self.episode_meta = json.load(f)
         
-        self.images = self.root['data/img']
-        self.agent_pos = self.root['data/agent_pos']
+        # Evaluation repeatedly visits the same 544 scene images through many
+        # episodes.  The Zarr image array is chunked by 100 images, so indexing
+        # it once per episode repeatedly decompresses the same large chunks.
+        # Materialize the small evaluation arrays once; element values, dtype,
+        # and episode indexing remain unchanged.
+        self.images = materialize_evaluation_array(
+            self.root['data/img'], name='data/img'
+        )
+        self.agent_pos = materialize_evaluation_array(
+            self.root['data/agent_pos'], name='data/agent_pos'
+        )
         self.episode_ends = self.root['meta/episode_ends'][:]
         
         # Load sample_id to image index mapping
@@ -261,11 +775,21 @@ class DPZarrDataset:
         # Check for embedded mask (unified format from generate_vla_v2)
         self.has_embedded_mask = 'mask' in self.root['data']
         if self.has_embedded_mask:
-            self.masks = self.root['data/mask']
+            self.masks = materialize_evaluation_array(
+                self.root['data/mask'], name='data/mask'
+            )
             print(f"  Embedded masks: {self.masks.shape}")
         
         self.num_episodes = len(self.episode_meta)
+        self.evaluation_indices = _evaluation_indices(
+            self.adjusted_start_manifest, self.num_episodes
+        )
         print(f"Loaded dataset: {self.num_episodes} episodes, {self.images.shape[0]} images")
+        if self.adjusted_start_manifest is not None:
+            print(
+                "  Adjusted-start eligible cohort: "
+                f"{len(self.evaluation_indices)}/{self.num_episodes} episodes"
+            )
 
     def _load_mask(self, sample_id: str, img_idx: int) -> Optional[np.ndarray]:
         """Load obstacle mask.
@@ -295,7 +819,27 @@ class DPZarrDataset:
         sample_id = meta['sample_id']
         img_idx = self.sample_id_to_img_idx[sample_id]
         image = np.array(self.images[img_idx])
-        gt_traj = np.array(self.agent_pos[start_idx:end_idx])
+        gt_traj = np.array(
+            self.agent_pos[start_idx:end_idx], dtype=np.float32, copy=True
+        )
+        original_horizon = int(gt_traj.shape[0])
+        original_start = np.asarray(meta['start'], dtype=np.float32)
+        if original_start.shape != (2,) or not np.all(np.isfinite(original_start)):
+            raise ValueError(
+                f"dataset_index={idx} has invalid canonical start {original_start!r}"
+            )
+        if self.adjusted_start_manifest is None:
+            adjusted_start = original_start.copy()
+            gt_suffix = gt_traj
+            gt_start_index = 0
+        else:
+            adjusted_start, gt_suffix, gt_start_index = _apply_adjusted_start(
+                self.adjusted_start_manifest,
+                dataset_index=int(idx),
+                sample_id=str(sample_id),
+                scene_id=str(meta['scene_id']),
+                gt_trajectory=gt_traj,
+            )
 
         obstacle_mask = self._load_mask(sample_id, img_idx)
 
@@ -307,9 +851,12 @@ class DPZarrDataset:
             target_category=meta['target_category'],
             direction=meta['direction'],
             goal=np.array(meta['goal']),
-            start=np.array(meta['start']),
+            start=adjusted_start,
             image=image,
-            gt_trajectory=gt_traj,
+            gt_trajectory=gt_suffix,
+            original_start=original_start,
+            original_horizon=original_horizon,
+            gt_start_index=gt_start_index,
             obstacle_mask=obstacle_mask,
         )
 
@@ -630,6 +1177,7 @@ def predict_trajectory_receding_with_timing(
 def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: List[np.ndarray],
                              instructions: List[str], device: str = 'cuda:0',
                              noise_seed: Optional[int] = None,
+                             noise_seeds: Optional[List[int]] = None,
                              action_definition: str = 'positions',
                              action_delta_anchor: Optional[float] = None,
                              action_eps: Optional[float] = None) -> List[np.ndarray]:
@@ -649,12 +1197,17 @@ def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: 
     B = len(images)
     if B == 0:
         return []
+    if noise_seed is not None and noise_seeds is not None:
+        raise ValueError("Pass either noise_seed or noise_seeds, not both")
+    if noise_seeds is not None and len(noise_seeds) != B:
+        raise ValueError(
+            f"noise_seeds length {len(noise_seeds)} does not match batch {B}"
+        )
     
     # Stack images: (B, 1, 3, H, W)
     img_tensors = []
     for img in images:
         img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        img_t = (img_t - 0.5) / 0.5  # Normalize to [-1, 1] if needed
         img_tensors.append(img_t)
     img_batch = torch.stack(img_tensors, dim=0).unsqueeze(1).to(device)  # (B, 1, 3, H, W)
     
@@ -669,9 +1222,10 @@ def predict_trajectory_batch(policy, images: List[np.ndarray], start_positions: 
     }
     
     # Batch predict
-    with _fixed_torch_rng(noise_seed, device):
-        with torch.no_grad():
-            result = policy.predict_action(obs_dict)
+    with _policy_generator_streams(policy, noise_seeds, device):
+        with _fixed_torch_rng(noise_seed, device):
+            with torch.no_grad():
+                result = policy.predict_action(obs_dict)
     
     actions = result['action'].cpu().numpy()  # (B, horizon, 2)
 
@@ -757,6 +1311,21 @@ def rollout_trajectory(policy, image: np.ndarray, start_pos: np.ndarray,
     return np.array(trajectory)
 
 
+def _cuda_sync(device: str) -> None:
+    """Block until queued CUDA work finishes.
+
+    CUDA kernels are asynchronous, so a bare ``perf_counter`` delta around
+    ``predict_action`` measures kernel *launch* time, not execution.  That made
+    the recorded DP latency nearly independent of the denoising step count and
+    not comparable with the FlowVLA evaluator, which synchronizes.
+    """
+    try:
+        if torch.cuda.is_available() and str(device).startswith('cuda'):
+            torch.cuda.synchronize(device)
+    except Exception:
+        pass
+
+
 def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
                      use_rollout: bool = False,
                      noise_seed: Optional[int] = None,
@@ -776,14 +1345,16 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
         'curv': 0.0,
         'has_mask': episode.obstacle_mask is not None
     }
+    pred_traj = None
     try:
+        _cuda_sync(device)
         t0 = time.perf_counter()
         if use_rollout:
             # Use receding horizon rollout
             pred_traj = rollout_trajectory(
                 policy, episode.image, episode.start, episode.goal,
                 instruction=episode.instruction,  # Pass instruction!
-                device=device, max_steps=200,
+                device=device, max_steps=episode.original_horizon,
                 noise_seed=noise_seed,
                 action_definition=action_definition,
                 action_delta_anchor=action_delta_anchor,
@@ -794,19 +1365,16 @@ def evaluate_episode(policy, episode: EpisodeData, device: str = 'cuda:0',
             pred_traj = predict_trajectory(
                 policy, episode.image, episode.start,
                 instruction=episode.instruction,  # Pass instruction!
-                device=device, horizon=len(episode.gt_trajectory),
+                device=device, horizon=episode.original_horizon,
                 noise_seed=noise_seed,
                 action_definition=action_definition,
                 action_delta_anchor=action_delta_anchor,
                 action_eps=action_eps,
             )
+        _cuda_sync(device)
         t1 = time.perf_counter()
         result['inference_ms'] = float((t1 - t0) * 1000.0)
 
-        # Keep metrics comparable: trim prediction to GT length if needed.
-        if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
-            pred_traj = pred_traj[:len(episode.gt_trajectory)]
-        
         # Compute metrics
         metrics = TrajectoryMetrics(
             pred_traj=pred_traj,
@@ -907,7 +1475,32 @@ def main():
                        help='Override diffusion denoising steps at inference time (if supported by the policy)')
     parser.add_argument('--seed', type=str, default=None,
                         help='Random seed(s): single int (e.g., 42) or comma-separated list (e.g., "1,2,3,4,5")')
+    parser.add_argument(
+        '--seeded_batch',
+        action='store_true',
+        help=(
+            'Batch deterministic seeded episodes with one independent torch '
+            'Generator per episode. This accelerates trajectory export; its '
+            'reported time is throughput and not batch-1 online latency.'
+        ),
+    )
+    parser.add_argument(
+        '--adjusted_start_manifest',
+        type=Path,
+        default=None,
+        help=(
+            'Shared evaluation-only manifest that advances invalid physical '
+            'starts along GT. Only its eligible original dataset indices are run.'
+        ),
+    )
     args = parser.parse_args()
+
+    adjusted_start_manifest = _load_adjusted_start_manifest(
+        args.adjusted_start_manifest
+    )
+    adjusted_start_manifest_provenance = _adjusted_start_provenance(
+        args.adjusted_start_manifest, adjusted_start_manifest
+    )
 
     # Parse seed argument
     seeds = []
@@ -922,6 +1515,53 @@ def main():
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dataset contents and adjusted-start episodes are seed-independent.  Keep
+    # one immutable in-memory cohort for all seeds so the same Zarr chunks are
+    # not decompressed five times.  Model loading intentionally remains inside
+    # the seed loop to preserve the historical seed-before-load semantics.
+    print(f"\nLoading dataset from {args.dataset}")
+    dataset = DPZarrDataset(
+        args.dataset,
+        load_mask=True,
+        adjusted_start_manifest=adjusted_start_manifest,
+    )
+    action_definition, action_delta_anchor, action_eps = _resolve_action_spec(
+        dataset=dataset,
+        action_definition=args.action_definition,
+        action_delta_anchor=args.action_delta_anchor,
+        action_eps=args.action_eps,
+    )
+    if action_definition == 'delta_normed_anchor':
+        print(
+            f"Action semantics: {action_definition} (scale={float(action_delta_anchor) + float(action_eps):.9g}, "
+            f"anchor={float(action_delta_anchor):.9g}, eps={float(action_eps):.9g})"
+        )
+    else:
+        print(f"Action semantics: {action_definition}")
+
+    evaluation_indices = list(dataset.evaluation_indices)
+    if args.num_episodes is not None:
+        if int(args.num_episodes) <= 0:
+            raise ValueError('--num_episodes must be positive')
+        if (
+            adjusted_start_manifest is not None
+            and int(args.num_episodes) < len(evaluation_indices)
+        ):
+            raise ValueError(
+                '--num_episodes cannot truncate an adjusted-start cohort; '
+                'use a smaller manifest for smoke tests'
+            )
+        if adjusted_start_manifest is None:
+            evaluation_indices = evaluation_indices[:int(args.num_episodes)]
+    num_episodes = len(evaluation_indices)
+    if num_episodes == 0:
+        raise ValueError('Adjusted-start manifest selected no eligible episodes')
+    all_episodes = [
+        dataset.get_episode(dataset_index)
+        for dataset_index in evaluation_indices
+    ]
+    print(f"\nPrepared {num_episodes} episodes for batch_size={args.batch_size}")
     
     # Run evaluation for each seed
     all_seed_results = {}
@@ -956,30 +1596,11 @@ def main():
             else:
                 print("Warning: policy has no attribute 'num_inference_steps'; ignoring --num_inference_steps")
         print(f"Model loaded. Horizon: {policy.horizon}, n_action_steps: {policy.n_action_steps}")
+        num_inference_steps_actual = getattr(policy, 'num_inference_steps', None)
+        if num_inference_steps_actual is not None:
+            num_inference_steps_actual = int(num_inference_steps_actual)
         if hasattr(policy, 'num_inference_steps'):
             print(f"Inference denoising steps: {policy.num_inference_steps}")
-        
-        # Load dataset
-        print(f"\nLoading dataset from {args.dataset}")
-        dataset = DPZarrDataset(args.dataset, load_mask=True)
-
-        # Resolve action semantics for this run.
-        action_definition, action_delta_anchor, action_eps = _resolve_action_spec(
-            dataset=dataset,
-            action_definition=args.action_definition,
-            action_delta_anchor=args.action_delta_anchor,
-            action_eps=args.action_eps,
-        )
-        if action_definition == 'delta_normed_anchor':
-            print(
-                f"Action semantics: {action_definition} (scale={float(action_delta_anchor) + float(action_eps):.9g}, "
-                f"anchor={float(action_delta_anchor):.9g}, eps={float(action_eps):.9g})"
-            )
-        else:
-            print(f"Action semantics: {action_definition}")
-        
-        num_episodes = args.num_episodes or dataset.num_episodes
-        num_episodes = min(num_episodes, dataset.num_episodes)
         
         print(f"\nEvaluating {num_episodes} episodes with batch_size={args.batch_size}...")
         
@@ -992,10 +1613,8 @@ def main():
 
         first_plan_ms_values: List[float] = []
         total_ms_values: List[float] = []
-    
         # If args.k is set, use receding-horizon replanning per episode (timings differ, batching disabled).
         if args.k is not None:
-            all_episodes = [dataset.get_episode(idx) for idx in range(num_episodes)]
             for idx, episode in enumerate(tqdm(all_episodes, desc="Episodes (receding)")):
                 try:
                     if current_seed is not None:
@@ -1011,7 +1630,7 @@ def main():
                         start_pos=episode.start,
                         instruction=episode.instruction,
                         device=args.device,
-                        horizon=len(episode.gt_trajectory),
+                        horizon=episode.original_horizon,
                         k=int(args.k),
                         noise_seed=noise_seed,
                         randomize_each_replan=randomize_each_replan,
@@ -1037,7 +1656,9 @@ def main():
                         'inference_ms': float(timing.get('total_ms', float('nan'))),
                     }
                 except Exception as e:
-                    pred_traj = np.zeros((len(episode.gt_trajectory), 2), dtype=np.float32)
+                    pred_traj = np.zeros(
+                        (episode.original_horizon, 2), dtype=np.float32
+                    )
                     result = {
                         'episode_idx': episode.episode_idx,
                         'sample_id': episode.sample_id,
@@ -1091,12 +1712,10 @@ def main():
 
         # Batch evaluation (much faster!)
         elif not args.use_rollout:
-            # Collect all episodes first
-            all_episodes = [dataset.get_episode(idx) for idx in range(num_episodes)]
-
-            # If a base seed is set, do deterministic per-episode evaluation.
-            # (Per-sample deterministic noise isn't possible in a single batched DP call.)
-            if current_seed is not None:
+            # Without seeded-batch mode, a base seed uses deterministic serial
+            # per-episode evaluation. Seeded-batch mode installs one independent
+            # generator per batch item in the batched branch below.
+            if current_seed is not None and not args.seeded_batch:
                 for idx, episode in enumerate(tqdm(all_episodes, desc="Episodes (seeded)")):
                     noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx))
                     t0 = time.perf_counter()
@@ -1106,7 +1725,7 @@ def main():
                         episode.start,
                         instruction=episode.instruction,
                         device=args.device,
-                        horizon=len(episode.gt_trajectory),
+                        horizon=episode.original_horizon,
                         noise_seed=noise_seed,
                         action_definition=action_definition,
                         action_delta_anchor=action_delta_anchor,
@@ -1127,10 +1746,6 @@ def main():
                         'has_mask': episode.obstacle_mask is not None,
                         'inference_ms': float((t1 - t0) * 1000.0),
                     }
-
-                    # Keep metrics comparable: trim prediction to GT length if needed.
-                    if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
-                        pred_traj = pred_traj[:len(episode.gt_trajectory)]
 
                     try:
                         metrics = TrajectoryMetrics(
@@ -1175,13 +1790,26 @@ def main():
                     # Batch inference
                     try:
                         t0 = time.perf_counter()
+                        per_episode_noise_seeds = None
+                        batch_noise_seed = None
+                        if current_seed is not None:
+                            per_episode_noise_seeds = [
+                                _episode_noise_seed(
+                                    int(current_seed),
+                                    int(episode.episode_idx),
+                                )
+                                for episode in batch_episodes
+                            ]
+                        else:
+                            batch_noise_seed = _random_noise_seed()
                         pred_trajs = predict_trajectory_batch(
                             policy,
                             images,
                             starts,
                             instructions,
                             args.device,
-                            noise_seed=_random_noise_seed(),
+                            noise_seed=batch_noise_seed,
+                            noise_seeds=per_episode_noise_seeds,
                             action_definition=action_definition,
                             action_delta_anchor=action_delta_anchor,
                             action_eps=action_eps,
@@ -1189,10 +1817,12 @@ def main():
                         t1 = time.perf_counter()
                         per_episode_ms = float((t1 - t0) * 1000.0 / max(1, len(batch_episodes)))
                         batch_inference_ms = [per_episode_ms for _ in range(len(batch_episodes))]
+                        batch_errors = ["" for _ in range(len(batch_episodes))]
                     except Exception as e:
                         print(f"Batch inference failed: {e}, falling back to single inference")
                         pred_trajs = []
                         batch_inference_ms = []
+                        batch_errors = []
                         for ep in batch_episodes:
                             try:
                                 t0 = time.perf_counter()
@@ -1202,8 +1832,15 @@ def main():
                                     ep.start,
                                     instruction=ep.instruction,
                                     device=args.device,
-                                    horizon=len(ep.gt_trajectory),
-                                    noise_seed=_random_noise_seed(),
+                                    horizon=ep.original_horizon,
+                                    noise_seed=(
+                                        _episode_noise_seed(
+                                            int(current_seed),
+                                            int(ep.episode_idx),
+                                        )
+                                        if current_seed is not None
+                                        else _random_noise_seed()
+                                    ),
                                     action_definition=action_definition,
                                     action_delta_anchor=action_delta_anchor,
                                     action_eps=action_eps,
@@ -1211,9 +1848,13 @@ def main():
                                 t1 = time.perf_counter()
                                 pred_trajs.append(traj)
                                 batch_inference_ms.append(float((t1 - t0) * 1000.0))
-                            except:
+                                batch_errors.append("")
+                            except Exception as single_error:
                                 pred_trajs.append(np.zeros((10, 2)))
                                 batch_inference_ms.append(float('nan'))
+                                batch_errors.append(
+                                    f"{type(single_error).__name__}: {single_error}"
+                                )
                     
                     # Compute metrics for each episode in batch
                     for i, (episode, pred_traj) in enumerate(zip(batch_episodes, pred_trajs)):
@@ -1233,11 +1874,10 @@ def main():
                         }
                         if i < len(batch_inference_ms):
                             result['inference_ms'] = float(batch_inference_ms[i])
+                        if i < len(batch_errors) and batch_errors[i]:
+                            result['error'] = batch_errors[i]
                         
                         try:
-                            # Keep metrics comparable: trim prediction to GT length if needed.
-                            if pred_traj is not None and len(pred_traj) > len(episode.gt_trajectory):
-                                pred_traj = pred_traj[:len(episode.gt_trajectory)]
                             metrics = TrajectoryMetrics(
                                 pred_traj=pred_traj,
                                 gt_traj=episode.gt_trajectory,
@@ -1268,8 +1908,7 @@ def main():
                                 print(f"Visualization failed for episode {idx}: {e}")
         else:
             # Rollout mode: must be sequential (receding horizon)
-            for idx in tqdm(range(num_episodes), desc="Rollout"):
-                episode = dataset.get_episode(idx)
+            for idx, episode in enumerate(tqdm(all_episodes, desc="Rollout")):
                 noise_seed = _episode_noise_seed(int(current_seed), int(episode.episode_idx)) if current_seed is not None else _random_noise_seed()
                 result, pred_traj = evaluate_episode(
                     policy,
@@ -1294,6 +1933,48 @@ def main():
                         visualize_episode(episode, pred_traj, result, vis_path)
                     except Exception as e:
                         print(f"Visualization failed for episode {idx}: {e}")
+
+        # Persist the exact per-episode predictions before aggregate reporting.
+        # This is a write-only side channel: legacy metrics above still use the
+        # unmodified model output, while the archive prepends the known start for
+        # continuous swept-footprint rescoring.
+        if len(results) != num_episodes or len(all_pred_trajs) != num_episodes:
+            raise RuntimeError(
+                "Incomplete evaluation output: "
+                f"results={len(results)}, trajectories={len(all_pred_trajs)}, "
+                f"expected={num_episodes}"
+            )
+        episode_by_index = {
+            int(episode.episode_idx): episode for episode in all_episodes
+        }
+        for result in results:
+            episode = episode_by_index[int(result['episode_idx'])]
+            result['gt_start_index'] = int(episode.gt_start_index)
+            result['original_horizon'] = int(episode.original_horizon)
+            result['gt_suffix_length'] = int(len(episode.gt_trajectory))
+        trajectory_archive_path = seed_output_dir / TRAJECTORY_ARCHIVE_FILENAME
+        save_trajectory_archive(
+            path=trajectory_archive_path,
+            results=results,
+            pred_trajectories=all_pred_trajs,
+            episode_meta=dataset.episode_meta,
+            episode_start_by_index={
+                int(episode.episode_idx): episode.start
+                for episode in all_episodes
+            },
+            gt_start_index_by_index={
+                int(episode.episode_idx): int(episode.gt_start_index)
+                for episode in all_episodes
+            },
+            original_horizon_by_index={
+                int(episode.episode_idx): int(episode.original_horizon)
+                for episode in all_episodes
+            },
+            adjusted_start_manifest_provenance=(
+                adjusted_start_manifest_provenance
+            ),
+        )
+        print(f"Trajectory archive saved to {trajectory_archive_path}")
         
         # Compute aggregate metrics
         valid_results = [r for r in results if r.get('fge') != float('inf')]
@@ -1397,13 +2078,27 @@ def main():
         results_file = seed_output_dir / "results.json"
         with open(results_file, 'w') as f:
             json.dump({
-                'config': {
-                'checkpoint': args.checkpoint,
-                'dataset': args.dataset,
-                'num_episodes': len(results),
-                'use_rollout': args.use_rollout,
-                'seed': seed
-            },
+                'config': build_evaluation_config(
+                    checkpoint=args.checkpoint,
+                    dataset=args.dataset,
+                    num_episodes=len(results),
+                    use_rollout=args.use_rollout,
+                    seed=seed,
+                    device=args.device,
+                    batch_size=args.batch_size,
+                    num_inference_steps_requested=args.num_inference_steps,
+                    num_inference_steps_actual=num_inference_steps_actual,
+                    k=args.k,
+                    visualize_every=args.visualize_every,
+                    action_definition_requested=args.action_definition,
+                    action_definition_resolved=action_definition,
+                    action_delta_anchor_resolved=action_delta_anchor,
+                    action_eps_resolved=action_eps,
+                    seeded_batch=args.seeded_batch,
+                    adjusted_start_manifest_provenance=(
+                        adjusted_start_manifest_provenance
+                    ),
+                ),
             'overall': {
                 'fge_mean': float(np.mean(fge_values)),
                 'fge_std': float(np.std(fge_values)),
@@ -1452,10 +2147,11 @@ def main():
         # Save CSV
         csv_file = seed_output_dir / "metrics.csv"
         with open(csv_file, 'w') as f:
-            f.write("episode_idx,scene_id,instruction,fge,cr,plr,curv,inference_ms\n")
+            f.write("dataset_index,episode_idx,sample_id,scene_id,instruction,fge,cr,plr,curv,inference_ms\n")
             for r in results:
                 instruction = r.get('instruction', '')[:50].replace(',', ' ').replace('\n', ' ')
-                f.write(f"{r.get('episode_idx', '')},{r.get('scene_id', '')},{instruction},"
+                dataset_index = r.get('episode_idx', '')
+                f.write(f"{dataset_index},{r.get('episode_idx', '')},{r.get('sample_id', '')},{r.get('scene_id', '')},{instruction},"
                        f"{r.get('fge', '')},{r.get('cr', '')},{r.get('plr', '')},{r.get('curv', '')},{r.get('inference_ms', '')}\n")
         
         print(f"CSV saved to {csv_file}")
